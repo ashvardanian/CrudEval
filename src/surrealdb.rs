@@ -8,7 +8,6 @@
 //! cargo run --release --no-default-features --features surrealdb-backend \
 //!     --bin crud-eval-surrealdb -- --data-model documents --durability flushed
 //! ```
-#![feature(allocator_ext, btreemap_alloc)]
 
 use std::{
     alloc::System,
@@ -239,8 +238,8 @@ fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
     ))
 }
 impl Backend for SurrealBackend {
-    fn metadata(&self) -> BTreeMap<String, Value, System> {
-        let mut result = BTreeMap::new_in(System);
+    fn metadata(&self) -> BTreeMap<String, Value> {
+        let mut result = BTreeMap::new();
         result.extend([
             ("backend".into(), json!("surrealdb")),
             ("image".into(), json!(IMAGE)),

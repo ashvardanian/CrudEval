@@ -8,7 +8,6 @@
 //! cargo run --release --no-default-features --features mongodb-backend \
 //!     --bin crud-eval-mongodb -- --records 100K --threads 4 --durability buffered
 //! ```
-#![feature(allocator_ext, btreemap_alloc)]
 
 use std::{alloc::System, collections::BTreeMap, path::Path};
 
@@ -191,9 +190,9 @@ fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backen
     ))
 }
 impl Backend for MongoDbBackend {
-    fn metadata(&self) -> BTreeMap<String, Value, System> {
+    fn metadata(&self) -> BTreeMap<String, Value> {
         {
-            let mut metadata = BTreeMap::new_in(System);
+            let mut metadata = BTreeMap::new();
             metadata.extend([
                 ("backend".into(), json!(format!("{:?}", self.server).to_lowercase())),
                 ("image".into(), json!(self.image)),

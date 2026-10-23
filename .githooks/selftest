@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+#
+# Feeds known-good and known-bad fixtures through the real `pre-commit` and `commit-msg` and asserts the
+# verdict. Run it after touching any check:
+#
+#     .githooks/selftest
+#
+# A rejection counts only when exactly one check fired and it was the expected one, which turns every
+# rejected fixture into a false-positive test for all the other rules. Each rule also gets an accepted
+# fixture, usually prose naming the construct the rule bans.
+
+set -u
+export LC_ALL=C
+
+hooks_directory=$(cd "$(dirname "$0")" && pwd)
+scratch_root=${SELFTEST_DIR:-${TMPDIR:-/tmp}/pre-commit-selftest-$$}
+rm -rf "$scratch_root"
+mkdir -p "$scratch_root"
+trap 'rm -rf "$scratch_root"' EXIT
+
+passed_count=0
+failed_count=0
+fixture_ordinal=0
+
+# region Fixture Helpers
+
+# A throwaway repository outside this tree, with one empty commit so `git diff --cached` has a HEAD.
+create_fixture_repository() {
+    fixture_ordinal=$((fixture_ordinal + 1))
+    fixture_directory="$scratch_root/fixture-$fixture_ordinal"
+    mkdir -p "$fixture_directory"
+    git -C "$fixture_directory" init --quiet
+    git -C "$fixture_directory" config user.email selftest@example.invalid
+    git -C "$fixture_directory" config user.name Selftest
+    git -C "$fixture_directory" commit --quiet --allow-empty -m "Chore: Seed the fixture"
+}
+
+# Stages stdin at the path, behind the `//!` module doc every Rust source opens with.
+stage_fixture_with_header() { # stage_fixture_with_header <relative-path> <<< content
+    create_fixture_repository
+    local fixture_path="$fixture_directory/$1"
+    mkdir -p "$(dirname "$fixture_path")"
+    case "$1" in
+    *.rs) { printf '//! One staged fixture for one rule.\n\n'; cat; } > "$fixture_path" ;;
+    *) cat > "$fixture_path" ;;
+    esac
+    git -C "$fixture_directory" add -- "$1"
+}
+
+# Stages stdin at the path exactly as given, for the rules about the file header itself.
+stage_fixture_verbatim() { # stage_fixture_verbatim <relative-path> <<< content
+    create_fixture_repository
+    local fixture_path="$fixture_directory/$1"
+    mkdir -p "$(dirname "$fixture_path")"
+    cat > "$fixture_path"
+    git -C "$fixture_directory" add -- "$1"
+}
+
+run_precommit() { # run_precommit [--all-lines <relative-path>...]
+    hook_output=$(cd "$fixture_directory" && "$hooks_directory/pre-commit" "$@" 2>&1)
+    hook_status=$?
+    fired_count=$(printf '%s\n' "$hook_output" | sed -n 's/^pre-commit: \([0-9][0-9]*\) check(s) failed$/\1/p')
+    [ -n "$fired_count" ] || fired_count=0
+}
+
+report_failure() { # report_failure <label> <detail>
+    failed_count=$((failed_count + 1))
+    echo "FAIL  $1"
+    echo "      $2"
+    printf '%s\n' "$hook_output" | sed 's/^/      | /' | head -8
+}
+
+expect_rejection() { # expect_rejection <label> <phrase-identifying-the-rule>
+    if [ "$hook_status" -eq 0 ]; then
+        report_failure "$1" "expected a rejection, the hook accepted it"
+    elif ! printf '%s\n' "$hook_output" | grep -qF -- "$2"; then
+        report_failure "$1" "rejected, but not by the expected rule, wanted: $2"
+    elif [ "$fired_count" -ne 1 ]; then
+        report_failure "$1" "$fired_count rules fired, expected exactly 1; another rule is over-matching"
+    else
+        passed_count=$((passed_count + 1))
+    fi
+}
+
+expect_acceptance() { # expect_acceptance <label>
+    if [ "$hook_status" -ne 0 ]; then
+        report_failure "$1" "expected acceptance, $fired_count rule(s) rejected it"
+    else
+        passed_count=$((passed_count + 1))
+    fi
+}
+
+assert_rejects() { # assert_rejects <label> <phrase> <relative-path> <<< content
+    stage_fixture_with_header "$3"
+    run_precommit
+    expect_rejection "$1" "$2"
+}
+
+assert_accepts() { # assert_accepts <label> <relative-path> <<< content
+    stage_fixture_with_header "$2"
+    run_precommit
+    expect_acceptance "$1"
+}
+
+assert_verbatim_rejects() { # assert_verbatim_rejects <label> <phrase> <relative-path> <<< content
+    stage_fixture_verbatim "$3"
+    run_precommit
+    expect_rejection "$1" "$2"
+}
+
+assert_verbatim_accepts() { # assert_verbatim_accepts <label> <relative-path> <<< content
+    stage_fixture_verbatim "$2"
+    run_precommit
+    expect_acceptance "$1"
+}
+
+run_commit_msg() { # run_commit_msg <<< message
+    fixture_ordinal=$((fixture_ordinal + 1))
+    local message_path="$scratch_root/message-$fixture_ordinal"
+    cat > "$message_path"
+    hook_output=$("$hooks_directory/commit-msg" "$message_path" 2>&1)
+    hook_status=$?
+}
+
+assert_message_rejects() { # assert_message_rejects <label> <phrase> <<< message
+    run_commit_msg
+    if [ "$hook_status" -eq 0 ]; then
+        report_failure "$1" "expected a rejection, commit-msg accepted it"
+    elif ! printf '%s\n' "$hook_output" | grep -qF -- "$2"; then
+        report_failure "$1" "rejected, but not for the expected reason, wanted: $2"
+    else
+        passed_count=$((passed_count + 1))
+    fi
+}
+
+assert_message_accepts() { # assert_message_accepts <label> <<< message
+    run_commit_msg
+    if [ "$hook_status" -ne 0 ]; then
+        report_failure "$1" "expected acceptance, commit-msg rejected it"
+    else
+        passed_count=$((passed_count + 1))
+    fi
+}
+
+# endregion Fixture Helpers
+
+# region Prose Fixtures
+
+assert_rejects "banner ruler" "adds a banner ruler" scripts/probe.sh <<'FIXTURE'
+# ----
+echo probe
+FIXTURE
+
+assert_accepts "YAML document marker" config/probe.yml <<'FIXTURE'
+---
+probe: key
+FIXTURE
+
+assert_rejects "pipe table in a Rust comment" "draws a pipe table" src/probe.rs <<'FIXTURE'
+// | Rows | Bytes |
+fn probe() {}
+FIXTURE
+
+assert_rejects "ASCII arrow in a comment" "writes an arrow as" src/probe.rs <<'FIXTURE'
+// Maps each key -> its slot.
+fn probe() {}
+FIXTURE
+
+assert_accepts "ASCII arrow in a code span" src/probe.rs <<'FIXTURE'
+// Maps each key to its slot, as `key -> slot` reads.
+fn probe() {}
+FIXTURE
+
+assert_rejects "glued Unicode arrow" "glues a Unicode arrow" src/probe.rs <<'FIXTURE'
+// Casts FP8→FP16 once per tile.
+fn probe() {}
+FIXTURE
+
+assert_rejects "usage pseudo-heading" "labels a code block with a pseudo-heading" scripts/probe.sh <<'FIXTURE'
+# Usage:
+echo probe
+FIXTURE
+
+assert_rejects "two empty comment lines in a row" "leaves two empty comment lines in a row" src/probe.rs <<'FIXTURE'
+// One paragraph.
+//
+//
+// Another paragraph.
+fn probe() {}
+FIXTURE
+
+assert_rejects "backward-looking comment" "backward-looking comment" src/probe.rs <<'FIXTURE'
+// The ranking used to be a heap.
+fn probe() {}
+FIXTURE
+
+assert_rejects "miscased vendor in a comment" "miscases a name" src/probe.rs <<'FIXTURE'
+// Runs on Nvidia GPUs.
+fn probe() {}
+FIXTURE
+
+assert_rejects "double space between sentences" "double-spaces between sentences" src/probe.rs <<'FIXTURE'
+// One sentence.  Another sentence.
+fn probe() {}
+FIXTURE
+
+# endregion Prose Fixtures
+
+# region Rust Fixtures
+
+assert_accepts "clean module" src/probe.rs <<'FIXTURE'
+use std::fmt;
+
+use clap::Parser;
+
+fn probe(index: usize) -> usize {
+    index
+}
+FIXTURE
+
+assert_rejects "imports out of order" "breaks the Rust import groups" src/probe.rs <<'FIXTURE'
+use clap::Parser;
+
+use std::fmt;
+
+fn probe() {}
+FIXTURE
+
+assert_verbatim_rejects "missing module doc" "opens without a //! module doc" src/probe.rs <<'FIXTURE'
+fn probe() {}
+FIXTURE
+
+assert_rejects "macro definition" "macro_rules!" src/probe.rs <<'FIXTURE'
+macro_rules! probe {
+    () => {};
+}
+FIXTURE
+
+assert_rejects "deprecation" "adds a deprecation" src/probe.rs <<'FIXTURE'
+#[deprecated]
+fn probe() {}
+FIXTURE
+
+assert_rejects "abbreviated name" "abbreviates a word this project spells out" src/probe.rs <<'FIXTURE'
+fn probe(idx: usize) -> usize {
+    idx
+}
+FIXTURE
+
+assert_rejects "trailing whitespace" "whitespace errors" src/probe.rs <<< 'fn probe() {} '
+
+# endregion Rust Fixtures
+
+# region Other File Fixtures
+
+assert_rejects "ruff finding on an added line" "has ruff lint findings on its added lines" scripts/probe.py <<'FIXTURE'
+import os
+FIXTURE
+
+assert_rejects "ruff format drift on an added line" "is not ruff-format clean on its added lines" scripts/probe.py <<'FIXTURE'
+probe=1
+FIXTURE
+
+assert_rejects "generated artifact" "is generated output" scripts/__pycache__/probe.pyc <<'FIXTURE'
+compiled
+FIXTURE
+
+assert_rejects "unnamed workflow step" "without a name" .github/workflows/probe.yml <<'FIXTURE'
+name: Probe
+on: push
+jobs:
+  probe:
+    name: Probe
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo probe
+FIXTURE
+
+# endregion Other File Fixtures
+
+# region Commit Message Fixtures
+
+assert_message_rejects "unknown verb" "approved verb" <<'FIXTURE'
+Refactor: Split the dispatch table
+FIXTURE
+
+assert_message_rejects "lowercase summary" "approved verb" <<'FIXTURE'
+Fix: split the dispatch table
+FIXTURE
+
+assert_message_accepts "approved verb" <<'FIXTURE'
+Improve: Split the dispatch table
+FIXTURE
+
+assert_message_rejects "assistant trailer" "AI-assistant attribution" <<'FIXTURE'
+Fix: Split the dispatch table
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+FIXTURE
+
+assert_message_accepts "prose mentioning generation" <<'FIXTURE'
+Improve: Split the dispatch table
+
+Each generation of the table keeps its own entries.
+FIXTURE
+
+# endregion Commit Message Fixtures
+
+echo ""
+echo "selftest: $passed_count passed, $failed_count failed"
+[ "$failed_count" -eq 0 ] || exit 1
+exit 0

@@ -1,0 +1,807 @@
+#!/usr/bin/env bash
+#
+# CrudEval pre-commit: enforce the house style on staged changes before they land.
+#
+# Each check is one function named after the rule it enforces, and prints why it fired. Line checks read
+# the added lines of a staged file, so legacy code migrates on its own schedule; structural checks read the
+# whole staged file and report only the lines the commit added. The dispatch loop at the bottom diffs every
+# staged file once and routes it by extension. `.githooks/selftest` holds one fixture per rule.
+# Arm the hooks once per clone with: git config core.hooksPath .githooks
+#
+# Bypass knowingly, which you almost never should, with: git commit --no-verify
+
+set -u
+export LC_ALL=C # Byte-wise regexes, immune to the committer's locale
+
+rejection_count=0
+
+# region Project Settings
+
+project_name="CrudEval"
+abbreviations_refused="hi lo bot acc accum tmp temp res bcast ext idx cnt buf val obj elem"
+rustfmt_command="cargo fmt"
+ruff_lint_options="--target-version py311 --extend-select I"
+
+# endregion Project Settings
+
+
+# region Shared Helpers
+
+# Prints the reason and the first offending lines. Counts rather than latches, because the selftest
+# asserts that a bad fixture trips exactly one rule.
+reject_with_reason() { # reject_with_reason <matches> <message-line>...
+    local matches=$1
+    shift
+    local message_line
+    for message_line in "$@"; do echo "pre-commit: $message_line"; done
+    printf '%s\n' "$matches" | head -5
+    rejection_count=$((rejection_count + 1))
+}
+
+# Line classes over `staged_added_text`, whose lines keep the diff's leading `+`: any comment marker, a
+# documentation line that is `/**`, a docblock body line or `//`, and a docblock line alone.
+added_comment_line_pattern='^\+[[:space:]]*(\*|/\*|//)'
+added_documentation_line_pattern='^\+[[:space:]]*(/\*\*|\*([[:space:]]|$)|//)'
+added_docblock_line_pattern='^\+[[:space:]]*(/\*\*|\*([[:space:]]|$))'
+# Matches added text with a comment marker anywhere, which every rule behind it needs before it can fire.
+added_comment_marker_regex=$'(^|\n)\\+[[:space:]]*\\*|//|/\\*'
+
+# Predicates over one source line, available to every program `scan_staged_file_marking_added_lines` runs.
+comment_structure_awk='
+    function is_docblock_opener(line) { return line ~ /^[[:space:]]*\/\*\*/ }
+    function is_comment_closer(line) { return line ~ /\*\/[[:space:]]*$/ }
+    function is_empty_comment_line(line) { return line ~ /^[[:space:]]*\*[[:space:]]*$/ }
+    function without_code_spans(text,    start, length_) {
+        gsub(/`[^`]*`/, "C", text)
+        while ((start = index(text, "<code")) && (length_ = index(substr(text, start), "</code>")))
+            text = substr(text, 1, start - 1) "C" substr(text, start + length_ + 6)
+        return text
+    }
+'
+
+# Buffers one comment paragraph and, at its end, reports each line that breaks mid-sentence while the next
+# word would still fit under the paragraph's own measure: its widest other line, capped at 100. The caller
+# defines `characters(text)`.
+paragraph_room_awk='
+    function first_word(text) {
+        if (text ~ /^`[^`]*`/) { match(text, /^`[^`]*`[^[:space:]]*/); return substr(text, 1, RLENGTH) }
+        sub(/[[:space:]].*$/, "", text); return text
+    }
+    function hold_paragraph_line(line, body, width) { ++held; held_line[held] = line; held_body[held] = body; held_width[held] = width }
+    function report_paragraph_room(    index_, other, measure, word) {
+        for (index_ = 1; index_ < held; ++index_) {
+            if (held_body[index_] ~ /[.:;!?][])"`\047]*$/) continue
+            if (!((held_line[index_] in added) || (held_line[index_ + 1] in added))) continue
+            measure = 0
+            for (other = 1; other <= held; ++other) if (other != index_ && held_width[other] > measure) measure = held_width[other]
+            if (measure > 100) measure = 100
+            word = first_word(held_body[index_ + 1])
+            if (held_width[index_] + 1 + characters(word) <= measure) printf "line %d: room for `%s` from the next line\n", held_line[index_], word
+        }
+        held = 0
+    }
+'
+
+# Runs an awk program over the staged file with `added[line]` preloaded, so a structural check sees the
+# whole file as context and still reports only what this commit added.
+scan_staged_file_marking_added_lines() { # scan_staged_file_marking_added_lines <awk-program>
+    awk "$comment_structure_awk"'NR == FNR { added[$1 + 0]; next } '"$1" "$staged_lines_path" "$staged_text_path"
+}
+
+# Blanks C-family comments to spaces, keeping every line and column in place, so a code check never fires
+# on a comment that merely names the construct it bans. String and character literals pass through.
+blank_c_comments_preserving_columns() { # blank_c_comments_preserving_columns < source
+    awk '
+        {
+            output = ""
+            for (position = 1; position <= length($0); ++position) {
+                character = substr($0, position, 1)
+                pair = substr($0, position, 2)
+                if (state == "block") {
+                    if (pair == "*/") { state = ""; output = output "  "; ++position }
+                    else output = output " "
+                    continue
+                }
+                if (state == "string" || state == "character") {
+                    output = output character
+                    if (character == "\\") { output = output substr($0, position + 1, 1); ++position }
+                    else if ((state == "string" && character == "\"") || (state == "character" && character == "\047")) state = ""
+                    continue
+                }
+                if (pair == "//") { tail = substr($0, position); gsub(/./, " ", tail); output = output tail; break }
+                if (pair == "/*") { state = "block"; output = output "  "; ++position; continue }
+                if (character == "\"") state = "string"
+                else if (character == "\047") state = "character"
+                output = output character
+            }
+            if (state != "block") state = ""
+            print output
+        }'
+}
+
+# Prints the line numbers of the staged file that sit outside every function body, because whole-file
+# mode judges the documentation around code, not the working notes inside it.
+lines_outside_function_bodies() {
+    case "$staged_path" in
+    *.h | *.hpp | *.c | *.cpp | *.cc | *.cu | *.cuh | *.rs | *.pml)
+        printf '%s\n' "$staged_file_text" | blank_c_comments_preserving_columns | awk '
+            {
+                text = $0
+                gsub(/"(\\.|[^"\\])*"/, "\"\"", text); gsub(/\047(\\.|[^\047\\])\047/, "\047\047", text)
+                inside_at_start = (body_depth > 0)
+                if (directive_continues || text ~ /^[[:space:]]*#/) {
+                    directive_continues = (text ~ /\\[[:space:]]*$/)
+                    if (!inside_at_start) print NR
+                    next
+                }
+                for (position = 1; position <= length(text); ++position) {
+                    character = substr(text, position, 1)
+                    if (character == "{") {
+                        tail = header; sub(/^.*\)/, "", tail)
+                        if (body_depth > 0) kind = "body"
+                        else if (header ~ /(^|[^A-Za-z0-9_])(namespace|extern)([^A-Za-z0-9_]|$)/ && header !~ /\(/) kind = "container"
+                        else if (header ~ /(^|[^A-Za-z0-9_])(struct|class|union|enum)([^A-Za-z0-9_]|$)/ && header !~ /\)[[:space:]A-Za-z&]*$/) kind = "container"
+                        else if (header ~ /\)/ && tail !~ /=/) kind = "body"
+                        else kind = "other"
+                        kinds[++depth] = kind; if (kind == "body") ++body_depth
+                        header = ""
+                    } else if (character == "}") {
+                        if (depth > 0) { if (kinds[depth] == "body") --body_depth; --depth }
+                        header = ""
+                    } else if (character == ";") header = ""
+                    else header = header character
+                }
+                header = header " "
+                if (!(inside_at_start && body_depth > 0)) print NR
+            }'
+        ;;
+    *) printf '%s\n' "$staged_file_text" | awk '{ print NR }' ;;
+    esac
+}
+
+# endregion Shared Helpers
+
+# region Comments and Prose
+
+# ASCII "->" arrows inside comments & docstrings - prose uses the Unicode arrow (→). Lines quoting
+# code, in a span, a fence or an @code block, are the one legitimate use, so they are exempt.
+#
+# The arrow is the shape worth matching mechanically, not the whole rule. Prose in this project reads
+# as typeset text rather than as source: ≤ ≥ ≠ ≈ × ÷ ± − for relations and arithmetic, … for an
+# ellipsis, ⁰¹²³ and ₀₁₂₃ for indices and exponents, ∈ ∉ ⊆ ∪ ∩ ∅ for set talk, ∞ for a bound that has
+# none, and │ ├ └ ─ for a tree a diagram would otherwise draw in pipes and dashes. A rule can only
+# name the one case it can spot without arguing; the rest is the author's to reach for.
+check_ascii_arrows() {
+    local arrows comment_opener
+    case "$staged_path" in
+    *.mojo) comment_opener='#' ;;
+    *.md) comment_opener='^[[:space:]]*#|^[[:space:]]*\*([[:space:]]|$)' ;;
+    *) comment_opener='\/\/|\/\*|^[[:space:]]*\*([[:space:]]|$)' ;;
+    esac
+    arrows=$(scan_staged_file_marking_added_lines '
+        { body = $0; sub(/^[[:space:]]*(\/\/[\/!]?|#|\*)?[[:space:]]*/, "", body) }
+        body ~ /^```/ { inside_fence = !inside_fence; next }
+        /@(code|verbatim)/ { inside_code = 1 }
+        /@end(code|verbatim)/ { inside_code = 0; next }
+        !inside_fence && !inside_code && (FNR in added) {
+            prose = without_code_spans($0); gsub(/"(\\.|[^"\\])*"/, "\"\"", prose)
+            if (prose ~ /(('"$comment_opener"').*(<->|->|<-([^-]|$)))/) printf "line %d: %s\n", FNR, $0
+        }')
+    [ -z "$arrows" ] || reject_with_reason "$arrows" \
+        "$staged_path writes an arrow as '->', '<-' or '<->' in a comment - prose takes → ← ↔, and the same goes for ≤ ≥ ≠ × … ∈:"
+}
+
+# Rejects a Unicode arrow glued to a neighbour in prose, because `FP8 → FP16` reads as a relation and
+# `FP8→FP16` as one token. Code spans, fences and @code or @verbatim blocks are exempt.
+check_unicode_arrows_spaced() {
+    local glued
+    glued=$(scan_staged_file_marking_added_lines '
+        { body = $0; sub(/^[[:space:]]*(\/\/[\/!]?|#|\*)?[[:space:]]*/, "", body) }
+        body ~ /^```/ { inside_fence = !inside_fence; next }
+        /@(code|verbatim)/ { inside_code = 1 }
+        /@end(code|verbatim)/ { inside_code = 0; next }
+        !inside_fence && !inside_code && (FNR in added) {
+            prose = without_code_spans($0)
+            if (prose ~ /[^[:space:]](→|←|↦|↔)|(→|←|↦|↔)[^[:space:]]/) printf "line %d: %s\n", FNR, $0
+        }')
+    [ -z "$glued" ] || reject_with_reason "$glued" \
+        "$staged_path glues a Unicode arrow to its neighbours; write a space on each side, as in FP8 → FP16:"
+}
+
+# Rejects a comment line that is only a `Usage:`, `Commands:` or `Example usage:` label, because a sentence
+# introduces a code block and the block names its language.
+check_usage_label_absent() {
+    local labels
+    labels=$(printf '%s\n' "$staged_added_text" |
+        grep -nE '^\+[[:space:]]*(\*|//[/!]?|#)[[:space:]]*(Usage|Commands|Example usage|Examples?|Invocation|Or locally|Run)( [a-z]+)?:[[:space:]]*$' || true)
+    [ -z "$labels" ] || reject_with_reason "$labels" \
+        "$staged_path labels a code block with a pseudo-heading; introduce it with a sentence ending in a colon:"
+}
+
+# Rejects two empty comment lines in a row, because one empty line separates paragraphs and a second
+# only stretches the block.
+check_empty_comment_lines_single() {
+    local doubled
+    doubled=$(scan_staged_file_marking_added_lines '
+        {
+            marker = ""; if (match($0, /^[[:space:]]*(\*|\/\/\/?!?)[[:space:]]*$/)) { marker = $0; gsub(/[[:space:]]/, "", marker) }
+            if (marker != "" && marker == previous_marker && ((FNR in added) || ((FNR - 1) in added))) printf "line %d: a second empty comment line\n", FNR
+            previous_marker = marker
+        }')
+    [ -z "$doubled" ] || reject_with_reason "$doubled" \
+        "$staged_path leaves two empty comment lines in a row; keep one between paragraphs:"
+}
+
+# Comments describe what the code is, never what it was. Git holds the history.
+check_backward_references() {
+    local history
+    history=$(printf '%s\n' "$staged_added_text" |
+        grep -iE '(//|/\*|^\+[[:space:]]*\*).*\b(used to be|no longer|was formerly|previously|as before)\b' || true)
+    [ -z "$history" ] || reject_with_reason "$history" \
+        "$staged_path has a backward-looking comment - describe the present, git holds the history:"
+}
+
+# Rejects `Dtype` in any name or prose, and a miscased proper name in a comment, because each name has one
+# spelling: DType, NVIDIA, NumPy, AArch64, x86, NEON, SVE, RVV.
+check_proper_names_capitalized() {
+    local miscased
+    miscased=$({
+        printf '%s\n' "$staged_added_text" | grep -E '^\+.*([A-Za-z_]Dtype|\bDtype\b)'
+        printf '%s\n' "$staged_added_text" | grep -E '^\+[[:space:]]*(//|/\*|\*|#)' |
+            sed -E 's/`[^`]*`//g; s#https?://[^[:space:]]*##g' |
+            grep -E '\b(Nvidia|Aarch64|X86|Neon|Sve|Rvv)\b|(^|[^[:alnum:]_./])numpy([^[:alnum:]_./]|$)'
+    } || true)
+    [ -z "$miscased" ] || reject_with_reason "$miscased" \
+        "$staged_path miscases a name; write DType, NVIDIA, NumPy, AArch64, x86, NEON, SVE and RVV:"
+}
+
+# Rejects an abbreviation from `abbreviations_refused`, such as `hi` or `lo` for register halves, because
+# names and prose spell words out. A bare one in a comment always fires; in code only a name new since HEAD
+# fires, so touching a line never forces a rename the commit is not about.
+check_abbreviations_spelled_out() {
+    local abbreviated
+    abbreviated=$(awk -v abbreviations="$abbreviations_refused" '
+        BEGIN { count = split(abbreviations, words, " "); for (word = 1; word <= count; ++word) banned[words[word]] = 1 }
+        function has_banned_segment(token,    segments, total, segment) {
+            total = split(token, segments, "_")
+            for (segment = 1; segment <= total; ++segment) if (tolower(segments[segment]) in banned) return 1
+            return 0
+        }
+        FILENAME == ARGV[1] {
+            line = $0
+            while (match(line, /[A-Za-z_][A-Za-z0-9_]*/)) { existing[substr(line, RSTART, RLENGTH)] = 1; line = substr(line, RSTART + RLENGTH) }
+            next
+        }
+        FILENAME == ARGV[2] {
+            line = $0
+            while (match(line, /[A-Za-z_][A-Za-z0-9_]*/)) { declared[substr(line, RSTART, RLENGTH)] = 1; line = substr(line, RSTART + RLENGTH) }
+            next
+        }
+        {
+            prose = ($0 ~ /^\+[[:space:]]*(\*([[:space:]]|$)|\/\*|\/\/)/)
+            line = substr($0, 2)
+            if (prose) { gsub(/"[^"]*"/, "", line); gsub(/`[^`]*`/, "", line); gsub(/@[pc][[:space:]]+[^[:space:]]+/, "", line) }
+            while (match(line, /[A-Za-z_][A-Za-z0-9_]*/)) {
+                token = substr(line, RSTART, RLENGTH); accessor = substr(line, 1, RSTART - 1); line = substr(line, RSTART + RLENGTH)
+                if (!has_banned_segment(token) || accessor ~ /(\.|->)$/) continue
+                if (prose && (token in declared || token == toupper(token))) continue
+                if ((prose && token !~ /_/) || !(token in existing)) { print "    " token ": " substr($0, 2); break }
+            }
+        }' <(git show "HEAD:$staged_path" 2> /dev/null || true) \
+        <(printf '%s\n' "$staged_file_text" | blank_c_comments_preserving_columns) \
+        <(printf '%s\n' "$staged_added_text") || true)
+    [ -z "$abbreviated" ] || reject_with_reason "$abbreviated" \
+        "$staged_path abbreviates a word this project spells out; write \`high\`, \`low\`, \`accumulator\`, and so on:"
+}
+
+# endregion Comments and Prose
+
+# region Formatters
+
+# Rejects rustfmt drift across the crate, because `rustfmt.toml` is the law; `rustfmt_command` names the
+# toolchain that understands it, and the check skips without that toolchain or a crate.
+check_rustfmt_clean() {
+    [ -f Cargo.toml ] && command -v cargo > /dev/null 2>&1 && $rustfmt_command --version > /dev/null 2>&1 || return 0
+    git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -q . || return 0
+    $rustfmt_command --check > /dev/null 2>&1 && return 0
+    reject_with_reason "" "staged Rust changes are not rustfmt clean;" "            run: $rustfmt_command"
+}
+
+# Rejects Rust imports out of the standard library, external crates, own crate order, or without a blank line
+# between those groups and after the last one, which rustfmt leaves alone. It reads the whole source from stdin.
+check_rust_use_groups() { # check_rust_use_groups <own-crate> <path> < source
+    local findings
+    findings=$(awk -v own="$1" -v path="$2" -v quote="'" '
+        BEGIN { literal = "r#*\"|\"|" quote "(\\\\.|[^" quote "\\\\])" quote "|//|/\\*" }
+        function blanks(width) { return sprintf("%" width "s", "") }
+        function count(text, bracket) { return gsub(bracket, "", text) }
+        function group(root) {
+            if (root == "std" || root == "core" || root == "alloc") return 0
+            return root == own || root == "crate" || root == "self" || root == "super" ? 2 : 1
+        }
+        function blank(from, to,   line) {
+            for (line = from; line < to; ++line) if (source[line] ~ /[^[:space:]]/) return 0
+            return 1
+        }
+        {
+            source[NR] = $0
+            text = $0; masked = ""; plain = 0
+            while (text != "") {
+                if (depth) {
+                    if (!match(text, /\/\*|\*\//)) break
+                    depth += substr(text, RSTART, 2) == "/*" ? 1 : -1
+                    taken = RSTART + 1
+                } else if (closer != "" && !raw) {
+                    if (!match(text, /^([^"\\]|\\.)*"/)) break
+                    closer = ""; taken = RLENGTH
+                } else if (closer != "") {
+                    if (!(taken = index(text, closer))) break
+                    taken += length(closer) - 1; closer = ""
+                } else if (match(text, literal)) {
+                    masked = masked substr(text, 1, RSTART - 1)
+                    token = substr(text, RSTART, RLENGTH); text = substr(text, RSTART); taken = RLENGTH
+                    if (token == "//") break
+                    if (token == "/*") depth = 1
+                    else if (token ~ /"$/) { raw = token ~ /^r/; closer = "\"" substr(token, 2, RLENGTH - 2) }
+                } else { plain = 1; break }
+                masked = masked blanks(taken); text = substr(text, taken + 1)
+            }
+            code[NR] = masked (plain ? text : blanks(length(text)))
+        }
+        END {
+            for (line = 1; line <= NR; ++line) {
+                if (!match(code[line], /^ *(pub(\([^)]*\))? +)?use +(::)?[A-Za-z0-9_]+/)) continue
+                head = substr(code[line], 1, RLENGTH); rest = substr(code[line], RLENGTH + 1)
+                root = head; sub(/^.*[ :]/, "", root)
+                for (end = line; !index(rest, ";") && end < NR; rest = code[++end]) {}
+                start = line
+                while (start > 1 && code[start - 1] ~ /\][[:space:]]*$/) {
+                    candidate = start; nesting = 0
+                    while (candidate > 1) {
+                        --candidate
+                        nesting += count(code[candidate], "]") - count(code[candidate], "\\[")
+                        if (nesting == 0) break
+                    }
+                    if (code[candidate] !~ /^[[:space:]]*#\[/) break
+                    start = candidate
+                }
+                match(head, /^ */)
+                ++uses; starts[uses] = start; ends[uses] = end; indents[uses] = RLENGTH; roots[uses] = root
+            }
+            for (use = 1; use <= uses; ++use) {
+                category = group(roots[use]); after = source[ends[use] + 1]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", after)
+                if (use < uses && indents[use + 1] == indents[use] && blank(ends[use] + 1, starts[use + 1])) {
+                    if (group(roots[use + 1]) < category)
+                        printf "%s:%d: order imports as standard library, external crates, own crate\n", path, starts[use]
+                    if (group(roots[use + 1]) != category && ends[use] + 1 == starts[use + 1])
+                        printf "%s:%d: separate import groups with a blank line\n", path, ends[use]
+                } else if (ends[use] < NR && after != "" && after != "}")
+                    printf "%s:%d: add a blank line after the last import\n", path, ends[use]
+            }
+        }')
+    [ -z "$findings" ] && return 0
+    echo "pre-commit: $2 breaks the Rust import groups - standard library, external crates, then the own crate," \
+        "a blank line apart:"
+    printf '%s\n' "$findings" | head -5
+    return 1
+}
+
+# Rejects ruff format drift that rewrites an added line or inserts beside one, because `pyproject.toml` is the
+# law and legacy lines migrate on their own schedule. It skips without ruff, and on a syntax error, which the
+# lint check reports.
+check_ruff_format_on_added_lines() {
+    command -v ruff > /dev/null 2>&1 || return 0
+    local formatted drift
+    formatted=$(ruff format --force-exclude --stdin-filename "$staged_path" - < "$staged_text_path" 2> /dev/null) || return 0
+    drift=$(diff -U0 "$staged_text_path" <(printf '%s\n' "$formatted") | awk '
+        NR == FNR { added[$1 + 0]; next }
+        /^@@/ {
+            split($2, range, ",")
+            start = -range[1]
+            count = (range[2] == "") ? 1 : range[2] + 0
+            touching = count == 0 && (start in added || (start + 1) in added)
+            for (line = start; line < start + count; ++line) if (line in added) touching = 1
+        }
+        touching && /^[-+@]/' "$staged_lines_path" -)
+    [ -z "$drift" ] || reject_with_reason "$drift" \
+        "$staged_path is not ruff-format clean on its added lines; run: ruff format $staged_path," \
+        "            or edit them as it would:"
+}
+
+# Rejects a ruff lint finding on an added line, because `pyproject.toml` is the law and legacy lines migrate
+# on their own schedule. A syntax error fires wherever ruff places it, as an unclosed bracket surfaces at the
+# end of the file. It skips without ruff.
+check_ruff_lint_on_added_lines() {
+    command -v ruff > /dev/null 2>&1 || return 0
+    local findings
+    findings=$(ruff check $ruff_lint_options --quiet --force-exclude --output-format=concise --stdin-filename "$staged_path" - \
+        < "$staged_text_path" 2> /dev/null |
+        awk -F: 'NR == FNR { added[$1 + 0]; next } ($2 + 0) in added || $4 == " invalid-syntax"' \
+            "$staged_lines_path" -)
+    [ -z "$findings" ] || reject_with_reason "$findings" \
+        "$staged_path has ruff lint findings on its added lines; run: ruff check --fix $staged_path," \
+        "            or fix them by hand:"
+}
+
+# Rejects taplo drift on staged TOML, because `.taplo.toml` is the law; it skips without taplo or its config.
+check_taplo_clean() {
+    command -v taplo > /dev/null 2>&1 && [ -f .taplo.toml ] || return 0
+    local staged_toml_paths=()
+    while IFS= read -r -d '' toml_path; do staged_toml_paths+=("$toml_path"); done \
+        < <(git diff --cached --name-only -z --diff-filter=ACM -- '*.toml')
+    [ ${#staged_toml_paths[@]} -gt 0 ] || return 0
+    taplo fmt --check "${staged_toml_paths[@]}" > /dev/null 2>&1 && return 0
+    reject_with_reason "" "staged TOML is not taplo clean;" "            run: taplo fmt"
+}
+
+# Rejects dprint drift, because `.dprint.json` is the law; it skips without dprint or its config.
+check_dprint_clean() {
+    command -v dprint > /dev/null 2>&1 && [ -e .dprint.json ] || return 0
+    local staged_json_yaml_paths=()
+    while IFS= read -r -d '' json_yaml_path; do staged_json_yaml_paths+=("$json_yaml_path"); done \
+        < <(git diff --cached --name-only -z --diff-filter=ACM -- '*.json' '*.jsonc' '*.yml' '*.yaml')
+    [ ${#staged_json_yaml_paths[@]} -gt 0 ] || return 0
+    dprint check "${staged_json_yaml_paths[@]}" > /dev/null 2>&1 && return 0
+    reject_with_reason "" "staged JSON or YAML is not dprint clean;" "            run: dprint fmt"
+}
+
+# endregion Formatters
+
+# region All Files
+
+# Compiled byte-code, caches and build output never belong in the tree. This one is a belt to
+# .gitignore's braces: a `git add -f` or a stale index entry still gets caught here.
+check_generated_artifacts() {
+    case "$staged_path" in
+    *.pyc | *.pyo | *__pycache__* | *.egg-info* | .pytest_cache/* | wheelhouse/* | dist/*)
+        echo "pre-commit: $staged_path is generated output and must not be committed"
+        rejection_count=$((rejection_count + 1))
+        ;;
+    esac
+}
+
+# CI workflows - every job and every step carries a `name:`. An unnamed step renders as its raw
+# command in the Actions UI, and job names are what branch protection's required checks reference,
+# so an anonymous one can't be pinned. Names are structure, not lines, so unlike the checks above
+# this validates the whole staged file - the workflows are small and already conform.
+check_workflow_names() {
+    local nameless
+    nameless=$(
+        printf '%s\n' "$staged_file_text" | awk '
+            # Jobs: two-space keys under the top-level `jobs:` section, named by a four-space `name:`.
+            /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+            in_jobs && /^[^ #]/ { in_jobs = 0 }
+            in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*$/ {
+                if (job != "" && !job_named) printf "line %d: job `%s` has no name\n", job_line, job
+                job = substr($1, 1, length($1) - 1); job_line = NR; job_named = 0
+            }
+            in_jobs && /^    name:/ { job_named = 1 }
+            # Steps: list items two deeper than their `steps:`, named inline or by a key two deeper.
+            /^[[:space:]]*steps:[[:space:]]*$/ { steps_at = index($0, "steps:") - 1; item_at = steps_at + 2; pending = 0; next }
+            steps_at {
+                indent = match($0, /[^ ]/) - 1
+                if ($0 ~ /^[[:space:]]*(#|$)/) next
+                if (indent <= steps_at) { if (pending) printf "line %d: unnamed step\n", pending; steps_at = 0; next }
+                if (indent == item_at && substr($0, item_at + 1, 2) == "- ") {
+                    if (pending) printf "line %d: unnamed step\n", pending
+                    pending = ($0 ~ /^[[:space:]]*- name:/) ? 0 : NR
+                } else if (pending && indent == item_at + 2 && $0 ~ /^[[:space:]]*name:/) pending = 0
+            }
+            END {
+                if (job != "" && !job_named) printf "line %d: job `%s` has no name\n", job_line, job
+                if (pending) printf "line %d: unnamed step\n", pending
+            }
+        '
+    )
+    [ -z "$nameless" ] || reject_with_reason "$nameless" \
+        "$staged_path has CI jobs or steps without a name - the Actions UI and required" \
+        "            checks reference them by it, so every job and step must carry one:"
+}
+
+# Rejects an added banner ruler outside Markdown: a comment that opens or closes on a run of `---`, `===`, `####`,
+# `////`, `***` or horizontal box-drawing strokes, a line of such runs around an optional label, or a string literal
+# that prints one. Box corners and verticals stay free for diagrams, a `|` line for Markdown tables, and YAML keeps
+# its `---` document marker. Reads `+` lines, or a whole diff, from stdin.
+check_banners() { # check_banners <path> < added-lines
+    case "$1" in
+    *.c | *.h | *.cc | *.cpp | *.cxx | *.hpp | *.hxx | *.cu | *.cuh | *.hip | *.metal | *.pml | *.py | *.pyi | *.pyx | \
+        *.rs | *.go | *.zig | *.mojo | *.js | *.mjs | *.cjs | *.ts | *.mts | *.tsx | *.swift | *.java | *.kt | *.cs | \
+        *.toml | *.yml | *.yaml | *.cmake | *CMakeLists.txt | *.sh) ;;
+    *) return 0 ;;
+    esac
+    local rulers
+    rulers=$(awk -v path="$1" -v quote="'" '
+        BEGIN {
+            stroke = "(─|━|┄|┅|┈|┉|╌|╍|═)"
+            run = "(---+|===+|####+|////+|\\*\\*\\*+|" stroke stroke stroke "+)"
+            marker = "^(#|//|/\\*|\\*|--|;)[!/*<]?[ \t]*"
+            printed = "(----+|====+|####+|" stroke stroke stroke "+)"
+            literal = "[\"" quote "][ \t]*" printed "|" printed "[ \t]*[\"" quote "]"
+        }
+        /^\+/ {
+            text = substr($0, 2); sub(/^[ \t]+/, "", text); sub(/[ \t\r]+$/, "", text)
+            if (text == "---" && path ~ /\.ya?ml$/) next
+            if (text ~ ("^" run "([ \t].*[ \t]" run ")?$") || text ~ (marker run "[ \t]*(\\*/)?([ \t]|$)") ||
+                (text ~ marker && text ~ ("[ \t]" run "[ \t]*(\\*/)?$")) || (text ~ literal && text !~ /\|/))
+                print
+        }')
+    [ -z "$rulers" ] && return 0
+    echo "pre-commit: $1 adds a banner ruler; name a section with #pragma region or # region, or a plain sentence:"
+    printf '%s\n' "$rulers" | head -5
+    return 1
+}
+
+# Rejects two or more spaces after `.`, `!` or `?` before a capital, because prose uses one space between
+# sentences. Lines tagged `nk-nolint: spacing` are exempt.
+check_single_space_between_sentences() {
+    local doubled
+    doubled=$(printf '%s\n' "$staged_added_text" | grep -v 'nk-nolint: spacing' |
+        sed -E 's,^\+,,; s,^[[:space:]]*(//[/!]?|#|\*),,' |
+        grep -nE '[.!?]  +[A-Z]' || true)
+    [ -z "$doubled" ] || reject_with_reason "$doubled" \
+        "$staged_path double-spaces between sentences;" "            use a single space after . ! or ?:"
+}
+
+# Rejects a pipe-table row in a comment of a code file, because a header table is plain columns aligned with
+# spaces, which reads the same in an editor, a terminal and a diff; pipe tables belong only in Markdown files.
+check_tables_aligned_not_piped() {
+    local piped
+    piped=$(printf '%s\n' "$staged_added_text" | grep -E '^\+[[:space:]]*(\*|//[/!]?|#)[[:space:]]+\|.*\|[[:space:]]*$' || true)
+    [ -z "$piped" ] || reject_with_reason "$piped" \
+        "$staged_path draws a pipe table in a comment; pipe tables belong only in Markdown, so align plain" \
+        "            columns with spaces, indented 4 past the prose, as in \`*      Instruction   Notes\`:"
+}
+
+# Rejects `macro_rules!`, because every per-type impl is written out explicitly.
+check_rust_macros_absent() {
+    local macros
+    macros=$(printf '%s\n' "$staged_added_text" | grep -nE 'macro_rules!' || true)
+    [ -z "$macros" ] || reject_with_reason "$macros" \
+        "$staged_path adds a \`macro_rules!\`;" "            write each impl out explicitly instead:"
+}
+
+# Nothing is deprecated: a symbol either exists or it was removed. Carrying a shim past a breaking
+# release means every consumer keeps two spellings alive, and neither ever wins.
+check_deprecations() {
+    local deprecations
+    deprecations=$(printf '%s\n' "$staged_added_text" | grep -iE '@deprecated|#\[deprecated' || true)
+    [ -z "$deprecations" ] || reject_with_reason "$deprecations" \
+        "$staged_path adds a deprecation - remove the symbol instead, and say so in the commit:"
+}
+
+# endregion All Files
+
+# region CrudEval Rules
+
+# Rejects a Rust file that does not open with a `//!` module doc, because every binary and module states
+# what it is for before any code.
+check_rust_module_doc_present() {
+    [[ $staged_file_text == '//!'* ]] && return 0
+    reject_with_reason "" "$staged_path opens without a //! module doc; say what the file is for on its first line"
+}
+
+# Rejects whitespace errors in the staged diff, such as trailing spaces or a space before a tab.
+check_whitespace_errors() {
+    local errors
+    errors=$(git diff --cached --check 2>&1) && return 0
+    reject_with_reason "$errors" "the staged changes carry whitespace errors:"
+}
+
+# Rejects markdownlint findings on staged Markdown, because `.markdownlint-cli2.jsonc` is the law; it skips
+# without a cached markdownlint-cli2 or its config.
+check_markdownlint_clean() {
+    [ -f .markdownlint-cli2.jsonc ] && npx --no-install markdownlint-cli2 --help > /dev/null 2>&1 || return 0
+    local staged_markdown_paths=()
+    while IFS= read -r -d '' markdown_path; do staged_markdown_paths+=("$markdown_path"); done \
+        < <(git diff --cached --name-only -z --diff-filter=ACM -- '*.md')
+    [ ${#staged_markdown_paths[@]} -gt 0 ] || return 0
+    npx --no-install markdownlint-cli2 "${staged_markdown_paths[@]}" > /dev/null 2>&1 && return 0
+    reject_with_reason "" "staged Markdown has markdownlint findings;" \
+        "            run: npx markdownlint-cli2 ${staged_markdown_paths[*]}"
+}
+
+# endregion CrudEval Rules
+
+# region Dispatch Tables
+
+# Routes one staged file through every prose and structure check its extension calls for.
+run_shared_checks() {
+    case "$staged_path" in
+    *.rs | *.py | *.sh)
+        check_ascii_arrows
+        check_unicode_arrows_spaced
+        check_usage_label_absent
+        check_empty_comment_lines_single
+        check_backward_references
+        check_proper_names_capitalized
+        check_tables_aligned_not_piped
+        ;;
+    esac
+    check_banners "$staged_path" <<< "$staged_added_text" || rejection_count=$((rejection_count + 1))
+    check_single_space_between_sentences
+}
+
+# Routes one staged file through the formatter its extension calls for.
+run_shared_formatters() {
+    case "$staged_path" in
+    *.py)
+        check_ruff_format_on_added_lines
+        check_ruff_lint_on_added_lines
+        ;;
+    esac
+}
+
+# Runs the checks that judge the staged tree as a whole rather than one file at a time.
+run_tree_checks() {
+    check_rustfmt_clean
+    check_taplo_clean
+    check_dprint_clean
+    check_markdownlint_clean
+    check_whitespace_errors
+}
+
+# Routes one staged file through the rules only this project keeps.
+run_project_checks() {
+    case "$staged_path" in
+    *.rs)
+        check_rust_module_doc_present
+        check_rust_macros_absent
+        check_deprecations
+        check_abbreviations_spelled_out
+        check_rust_use_groups crudeval "$staged_path" < "$staged_text_path" ||
+            rejection_count=$((rejection_count + 1))
+        ;;
+    .github/workflows/*.yml | .github/workflows/*.yaml) check_workflow_names ;;
+    esac
+}
+
+# endregion Dispatch Tables
+
+# region Parallel Judging
+
+# This region is identical in every hook that judges staged files one at a time; edit them all together.
+
+git rev-parse --verify HEAD > /dev/null 2>&1 || exit 0
+
+results_directory=$(mktemp -d)
+trap 'rm -rf "$results_directory"' EXIT
+
+# Splits a zero-context diff into files numbered in diff order from `ordinal + 1`: its hunks, its added lines,
+# their numbers, and the `--lines` ranges clang-format takes, where a hunk that only deletes covers one line.
+split_diff_by_path='
+    /^diff --git / {
+        close(diff); close(added); close(lines); close(ranges); ++ordinal; hunk = 0
+        diff = directory ordinal ".diff"; added = directory ordinal ".added"
+        lines = directory ordinal ".lines"; ranges = directory ordinal ".ranges"
+        next
+    }
+    /^@@/ {
+        hunk = 1
+        split($3, range, ",")
+        start = substr(range[1], 2) + 0
+        count = (range[2] == "") ? 1 : range[2] + 0
+        for (line = start; line < start + count; ++line) print line > lines
+        printf "--lines=%d:%d\n", start, start + (count ? count : 1) - 1 > ranges
+    }
+    hunk { print > diff }
+    hunk && /^\+/ { print > added }'
+
+# Lists the staged paths, writes their blobs under `index/` and splits their diff, one git process each, so
+# no check asks git again; `git diff` lists paths in the same order whether it prints names or hunks.
+read_staged_paths() {
+    staged_paths=()
+    while IFS= read -r -d '' staged_path; do staged_paths+=("$staged_path"); done \
+        < <(git diff --cached --name-only -z --diff-filter=ACM)
+    [ ${#staged_paths[@]} -eq 0 ] || printf '%s\0' "${staged_paths[@]}" |
+        git checkout-index --prefix="$results_directory/index/" -z --stdin
+    git diff --cached --unified=0 --diff-filter=ACM | awk -v directory="$results_directory/" "$split_diff_by_path"
+}
+
+# Deals the paths round-robin to one worker per core, each running `judge_path` into a numbered report, then
+# prints the reports in path order, so the output reads exactly as a serial run's would.
+judge_paths_in_parallel() { # judge_paths_in_parallel <path>...
+    local worker worker_count ordinal
+    worker_count=$(getconf _NPROCESSORS_ONLN 2> /dev/null || echo 4)
+    [ "$worker_count" -le $# ] || worker_count=$#
+    for ((worker = 0; worker < worker_count; ++worker)); do
+        (
+            ordinal=0
+            for staged_path in "$@"; do
+                ordinal=$((ordinal + 1))
+                [ $(((ordinal - 1) % worker_count)) -eq "$worker" ] || continue
+                # A selftest carries one violation per rule by design.
+                [ "$staged_path" = .githooks/selftest ] || judge_path > "$results_directory/$ordinal"
+            done
+            echo "$rejection_count" > "$results_directory/count-$worker"
+        ) &
+    done
+    wait
+    for ((ordinal = 1; ordinal <= $#; ++ordinal)); do
+        [ ! -f "$results_directory/$ordinal" ] || cat "$results_directory/$ordinal"
+    done
+    for ((worker = 0; worker < worker_count; ++worker)); do
+        rejection_count=$((rejection_count + $(cat "$results_directory/count-$worker")))
+    done
+}
+
+# Runs the staged-mode judging: the checks over the whole commit start first and overlap the per-path
+# workers, and still report after them.
+judge_staged_paths() {
+    read_staged_paths
+    (
+        run_tree_checks > "$results_directory/tree"
+        echo "$rejection_count" > "$results_directory/count-tree"
+    ) &
+    judge_paths_in_parallel ${staged_paths[@]+"${staged_paths[@]}"}
+    cat "$results_directory/tree"
+    rejection_count=$((rejection_count + $(cat "$results_directory/count-tree")))
+}
+
+# endregion Parallel Judging
+
+# region Dispatch
+
+# Points the checks at one path's files and loads its added lines, their numbers and its text; fails when the
+# path adds nothing. A mode without a diff judges its added lines as one.
+load_path_files() {
+    staged_diff_path=$results_directory/$ordinal.diff
+    staged_lines_path=$results_directory/$ordinal.lines
+    staged_ranges_path=$results_directory/$ordinal.ranges
+    [ -s "$results_directory/$ordinal.added" ] || return 1
+    [ -f "$staged_diff_path" ] || staged_diff_path=$results_directory/$ordinal.added
+    staged_added_text=$(< "$results_directory/$ordinal.added")
+    staged_added_line_numbers_list=$(< "$staged_lines_path")
+    staged_file_text=$(< "$staged_text_path")
+}
+
+# `--all-lines <path>...` judges whole working-tree files as though every line outside a function body were
+# added, and `--changed-lines <path>...` judges the lines they changed since HEAD; both skip the formatters
+# and the checks over the commit as a whole. With no arguments the hook judges what is staged.
+if [ "${1:-}" = --changed-lines ]; then
+    shift
+    judge_path() {
+        [ -f "$staged_path" ] || return 0
+        git diff HEAD --unified=0 -- "$staged_path" |
+            awk -v directory="$results_directory/" -v ordinal=$((ordinal - 1)) "$split_diff_by_path"
+        staged_text_path=$staged_path
+        load_path_files || return 0
+        run_shared_checks
+        run_project_checks
+    }
+    judge_paths_in_parallel "$@"
+elif [ "${1:-}" = --all-lines ]; then
+    shift
+    judge_path() {
+        [ -f "$staged_path" ] || return 0
+        staged_file_text=$(< "$staged_path")
+        [ -n "$staged_file_text" ] || return 0
+        printf '%s\n' "$(lines_outside_function_bodies)" > "$results_directory/$ordinal.lines"
+        awk -v added="$results_directory/$ordinal.added" 'NR == FNR { kept[$1]; next } FNR in kept { print "+" $0 > added }' \
+            "$results_directory/$ordinal.lines" "$staged_path"
+        staged_text_path=$staged_path
+        load_path_files || return 0
+        run_shared_checks
+        run_project_checks
+    }
+    judge_paths_in_parallel "$@"
+else
+    judge_path() {
+        check_generated_artifacts
+        staged_text_path=$results_directory/index/$staged_path
+        load_path_files || return 0
+        run_shared_checks
+        run_shared_formatters
+        run_project_checks
+    }
+    judge_staged_paths
+fi
+
+# endregion Dispatch
+
+if [ "$rejection_count" -ne 0 ]; then
+    echo ""
+    echo "pre-commit: $rejection_count check(s) failed"
+    echo "Fix the staged changes and commit again. Bypass knowingly with: git commit --no-verify"
+    exit 1
+fi
+exit 0

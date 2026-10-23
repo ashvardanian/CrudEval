@@ -8,7 +8,6 @@
 //! cargo run --release --no-default-features --features postgres-backend \
 //!     --bin crud-eval-postgres -- --records 100K --threads 4
 //! ```
-#![feature(allocator_ext, btreemap_alloc)]
 
 use std::{alloc::System, collections::BTreeMap, path::Path};
 
@@ -41,7 +40,7 @@ struct PostgresSession {
     client: Client,
     data_model: DataModel,
     transaction: bool,
-    statements: BTreeMap<&'static str, postgres::Statement, System>,
+    statements: BTreeMap<&'static str, postgres::Statement>,
     edges: Vec<GraphEdge, System>,
 }
 fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
@@ -91,9 +90,9 @@ fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
     ))
 }
 impl Backend for PostgresBackend {
-    fn metadata(&self) -> BTreeMap<String, Value, System> {
+    fn metadata(&self) -> BTreeMap<String, Value> {
         {
-            let mut metadata = BTreeMap::new_in(System);
+            let mut metadata = BTreeMap::new();
             metadata.extend([
                 ("backend".into(), json!("postgres")),
                 ("image".into(), json!("postgres:18.6")),
@@ -126,7 +125,7 @@ impl Backend for PostgresBackend {
                 client: Client::connect(&self.url, NoTls).map_err(|e| format!("{e:?}"))?,
                 data_model: self.data_model,
                 transaction: false,
-                statements: BTreeMap::new_in(System),
+                statements: BTreeMap::new(),
                 edges: Vec::new_in(System),
             },
             System,

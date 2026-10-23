@@ -67,7 +67,7 @@ pub struct ConfigReport {
     pub machine: MachineInfo,
     pub workload: CommonArgs,
     #[serde(serialize_with = "serialize_config")]
-    pub config: BTreeMap<String, Value, System>,
+    pub config: BTreeMap<String, Value>,
     pub capabilities: BackendCapabilities,
     pub phases: Vec<WorkloadReport>,
 }
@@ -126,7 +126,7 @@ pub fn write_report(directory: &Path, report: &ConfigReport) -> Result<PathBuf> 
 }
 
 fn serialize_config<S: serde::Serializer>(
-    value: &BTreeMap<String, Value, System>,
+    value: &BTreeMap<String, Value>,
     serializer: S,
 ) -> std::result::Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;

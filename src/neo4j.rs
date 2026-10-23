@@ -8,7 +8,6 @@
 //! cargo run --release --no-default-features --features neo4j-backend \
 //!     --bin crud-eval-neo4j -- --records 1K --threads 4 --data-model graph --durability flushed
 //! ```
-#![feature(allocator_ext, btreemap_alloc)]
 
 mod cypher;
 
@@ -40,13 +39,13 @@ struct Cli {
 }
 struct Neo4jBackend {
     container: ContainerHandle,
-    runtime: Arc<Runtime, System>,
+    runtime: Arc<Runtime>,
     graph: Graph,
     server: Server,
     image: &'static str,
 }
 struct Neo4jConnection {
-    runtime: Arc<Runtime, System>,
+    runtime: Arc<Runtime>,
     graph: Graph,
     optimistic_reads: bool,
     before: Vec<(Option<Key>, i64), System>,
@@ -260,7 +259,7 @@ fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backen
         ],
     };
     let container = ContainerHandle::start(image, 7687, path, storage, &env, &command)?;
-    let runtime = Arc::new_in(Runtime::new().map_err(|e| e.to_string())?, System);
+    let runtime = Arc::new(Runtime::new().map_err(|e| e.to_string())?);
     let uri = format!("127.0.0.1:{}", container.port);
     let (user, password) = match server {
         Server::Neo4j => ("neo4j", "crudeval-password"),
@@ -306,9 +305,9 @@ fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backen
     ))
 }
 impl Backend for Neo4jBackend {
-    fn metadata(&self) -> BTreeMap<String, Value, System> {
+    fn metadata(&self) -> BTreeMap<String, Value> {
         {
-            let mut metadata = BTreeMap::new_in(System);
+            let mut metadata = BTreeMap::new();
             metadata.extend([
                 ("backend".into(), json!(format!("{:?}", self.server).to_lowercase())),
                 ("image".into(), json!(self.image)),

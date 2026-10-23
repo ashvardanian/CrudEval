@@ -8,7 +8,6 @@
 //! cargo run --release --no-default-features --features scylladb-backend \
 //!     --bin crud-eval-scylladb -- --records 100K --threads 4
 //! ```
-#![feature(allocator_ext, btreemap_alloc)]
 
 use std::{alloc::System, collections::BTreeMap, future::Future, path::Path, time::Duration};
 
@@ -158,8 +157,8 @@ fn open(args: &CommonArgs, path: &Path, port: Option<Port>, time_limit: Duration
     ))
 }
 impl Backend for ScyllaBackend {
-    fn metadata(&self) -> BTreeMap<String, Value, System> {
-        let mut metadata = BTreeMap::new_in(System);
+    fn metadata(&self) -> BTreeMap<String, Value> {
+        let mut metadata = BTreeMap::new();
         metadata.extend([
             ("backend".into(), json!("scylladb")),
             ("image".into(), json!(IMAGE)),

@@ -8,7 +8,6 @@
 //! cargo run --release --no-default-features --features falkordb-backend \
 //!     --bin crud-eval-falkordb -- --records 1K --threads 4 --data-model graph
 //! ```
-#![feature(allocator_ext, btreemap_alloc)]
 
 mod cypher;
 
@@ -199,9 +198,9 @@ fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
     ))
 }
 impl Backend for FalkorDbBackend {
-    fn metadata(&self) -> BTreeMap<String, Value, System> {
+    fn metadata(&self) -> BTreeMap<String, Value> {
         {
-            let mut metadata = BTreeMap::new_in(System);
+            let mut metadata = BTreeMap::new();
             metadata.extend([
                 ("backend".into(), json!("falkordb")),
                 ("image".into(), json!("falkordb/falkordb:6.0.0")),

@@ -9,8 +9,6 @@
 //!     --bin crud-eval-sqlite -- --records 100K --threads 4
 //! ```
 
-#![feature(allocator_ext, btreemap_alloc)]
-
 use std::{
     alloc::System,
     collections::BTreeMap,
@@ -92,8 +90,8 @@ impl SqliteBackend {
     }
 }
 impl Backend for SqliteBackend {
-    fn metadata(&self) -> BTreeMap<String, serde_json::Value, System> {
-        let mut metadata = BTreeMap::new_in(System);
+    fn metadata(&self) -> BTreeMap<String, serde_json::Value> {
+        let mut metadata = BTreeMap::new();
         metadata.extend([
             ("backend".into(), json!("sqlite")),
             ("library_version".into(), json!(rusqlite::version())),

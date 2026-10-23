@@ -8,7 +8,6 @@
 //! cargo run --release --no-default-features --features redis-backend \
 //!     --bin crud-eval-redis -- --records 100K --threads 4
 //! ```
-#![feature(allocator_ext, btreemap_alloc)]
 
 use std::{alloc::System, collections::BTreeMap, num::NonZeroU16, path::Path};
 
@@ -214,9 +213,9 @@ fn open(
     ))
 }
 impl Backend for RedisBackend {
-    fn metadata(&self) -> BTreeMap<String, Value, System> {
+    fn metadata(&self) -> BTreeMap<String, Value> {
         {
-            let mut metadata = BTreeMap::new_in(System);
+            let mut metadata = BTreeMap::new();
             metadata.extend([
                 ("backend".into(), json!(format!("{:?}", self.server).to_lowercase())),
                 ("durability".into(), json!(self.durability)),

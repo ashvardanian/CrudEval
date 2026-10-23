@@ -415,7 +415,7 @@ impl Default for BackendCapabilities {
     }
 }
 pub trait Backend: Sync {
-    fn metadata(&self) -> BTreeMap<String, Value, System>;
+    fn metadata(&self) -> BTreeMap<String, Value>;
     fn capabilities(&self) -> BackendCapabilities;
     fn session(&self) -> Result<Box<dyn BackendSession + '_, System>>;
     fn flush(&self) -> Result<()>;

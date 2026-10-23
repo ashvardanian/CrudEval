@@ -10,15 +10,18 @@ jobs:
     steps:
       - name: Check Out Repository
         uses: actions/checkout@v4
-      - name: Install Nightly Rust with Rustfmt and Clippy
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-09-24
-          components: rustfmt, clippy
+      - name: Install Rust 1.100 with Rustfmt and Clippy
+        run: rustup toolchain install beta-2026-10-18 --profile minimal --component rustfmt,clippy
       - name: Set Up uv
         uses: astral-sh/setup-uv@v6
       - name: Install Clang and CMake
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake
         if: runner.os == 'Linux'
-      - name: Format, Lint and Test
-        run: scripts/check.sh
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
+      - name: Check Python Plotting
+        run: uvx ruff check --target-version py311 --extend-select I scripts/plot.py && uvx ruff format --check scripts/plot.py
+      - name: Lint Every Backend
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test Every Backend
+        run: cargo test --locked --all-features

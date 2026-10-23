@@ -300,8 +300,10 @@ SQLite's coordinator lock covers checkpointing outside timed CRUD operations.
 Schema 2 reports record attempted operation latency and successful committed throughput separately.
 Plots separate schema versions so their different measurement semantics cannot be silently combined.
 
-Install local checks with `git config core.hooksPath scripts`.
-Run `scripts/check.sh` for unit tests and lint checks, and `scripts/check-servers.sh` for managed server integration checks.
+The repository pins Rust 1.100, as `beta-2026-10-18` until its stable release.
+CI runs `cargo fmt --check`, Ruff on the plotting script, then `cargo clippy` and `cargo test` with every feature.
+Arm the Git hooks in `.githooks/` once per clone with `git config core.hooksPath .githooks`.
+Run `scripts/check-servers.sh` for managed server integration checks.
 
 ## Remaining scope
 

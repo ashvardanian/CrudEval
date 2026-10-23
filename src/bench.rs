@@ -1,8 +1,5 @@
 //! Shared benchmark runner: CLI sweeps, workload execution, and resumable data directories.
 
-#![feature(allocator_ext)]
-#![cfg_attr(test, feature(btreemap_alloc))]
-
 pub mod backend;
 pub mod data;
 #[cfg(feature = "tier2")]
@@ -1629,8 +1626,8 @@ mod tests {
         pending: Option<BTreeMap<Key, Option<Vec<u8>>>>,
     }
     impl Backend for Memory {
-        fn metadata(&self) -> BTreeMap<String, serde_json::Value, System> {
-            BTreeMap::new_in(System)
+        fn metadata(&self) -> BTreeMap<String, serde_json::Value> {
+            BTreeMap::new()
         }
         fn capabilities(&self) -> BackendCapabilities {
             BackendCapabilities {
