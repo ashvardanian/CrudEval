@@ -27,7 +27,7 @@ Each backend has its own binary:
 - Embedded engines: [`rocksdb.rs`](rocksdb.rs), [`lmdb.rs`](lmdb.rs), [`redb.rs`](redb.rs), [`fjall.rs`](fjall.rs), [`sqlite.rs`](sqlite.rs), and [`turso.rs`](turso.rs).
 - Database servers and variants: [`redis.rs`](redis.rs), [`mongodb.rs`](mongodb.rs), [`postgres.rs`](postgres.rs), [`neo4j.rs`](neo4j.rs), [`falkordb.rs`](falkordb.rs), [`surrealdb.rs`](surrealdb.rs), and [`scylladb.rs`](scylladb.rs).
 
-## Vocabulary and contracts
+## Vocabulary & Contracts
 
 `Backend` owns the database and is shared across workers.
 Each worker creates and uses its own `BackendSession`; sessions need not implement `Send`.
@@ -40,7 +40,7 @@ Point reads retain request order and a position for every missing key; an empty 
 `range_read` uses an inclusive lower bound and returns ascending, unique keys with aligned values.
 A full scan partitions the live key range into disjoint contiguous worker shards.
 
-`Key` is a UUID whose big-endian bytes preserve integer order.
+`Key` is a 16-byte UUID value; `KeyType` makes it from a record ordinal, decodes it back, and gives engines its big-endian bytes at the type's width, which sort as keys do.
 `KeySpace` reserves globally unique insert ranges and publishes them only after successful writes or commits, tracking the earliest uncommitted reservation per worker.
 Deletes claim the oldest live keys.
 The data manifest records the live floor and next key after successful mutating workloads; interrupted mutations require a fresh bulk load.
@@ -51,7 +51,7 @@ Documents update `/score` while retaining their deterministic payload.
 Graph updates change edge slot zero; slot identities survive deletion of incoming edges.
 Read-modify-write derives the next value from the value actually read.
 
-## Capabilities and measurement
+## Capabilities & Measurement
 
 `BackendCapabilities` describes implemented modalities, ordered ranges, transactions, and per-operation `BatchMode` values: native, pipelined, or per-record.
 Unsupported range workloads are reported as skipped and the remaining chain continues.
@@ -68,7 +68,7 @@ Value generation and verification are outside individual storage-call latency; o
 Workload elapsed time excludes session teardown and histogram merging.
 Flush time is separate, client resource sampling is process-wide, and optional hardware counters cover only benchmark worker threads.
 
-## Relationship to RetriEval
+## RetriEval Relationship
 
 Both crates use `src/bench.rs` as their library root, feature-gated backend binaries, `CommonArgs`, `Backend`, `ConfigReport`, `MachineInfo`, and `ContainerHandle`.
 Backend implementations use `<Engine>Backend` names, with `<Engine>Session` for storage worker state.

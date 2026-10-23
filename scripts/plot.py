@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["matplotlib>=3.9"]
 # ///
-"""Plot CrudEval JSON reports without mixing workloads or configurations."""
+"""Plot CrudEval JSON reports as SVG, without mixing workloads or configurations."""
 
 import argparse
 import json
@@ -12,6 +12,13 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+THEME = {
+    "field": "#C44536",
+    "ink": "#FFE6A7",
+    "frame": "#E5E5E5",
+    "font": ["Poppins", "Helvetica", "Arial", "sans-serif"],
+}
 
 
 def main():
@@ -42,6 +49,21 @@ def main():
         or (args.reports if args.reports.is_dir() else args.reports.parent) / "plots"
     )
     output.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update(
+        {
+            "figure.facecolor": THEME["field"],
+            "axes.facecolor": THEME["field"],
+            "axes.edgecolor": THEME["frame"],
+            "axes.labelcolor": THEME["ink"],
+            "axes.titlecolor": THEME["ink"],
+            "text.color": THEME["ink"],
+            "xtick.color": THEME["ink"],
+            "ytick.color": THEME["ink"],
+            "grid.color": THEME["ink"],
+            "font.family": THEME["font"],
+            "svg.fonttype": "none",
+        }
+    )
     metrics = [
         ("throughput", "Successful entries / second", lambda p: p["throughput"]),
         (
@@ -85,13 +107,13 @@ def main():
                 if row_model == model and phase["workload"] == workload
             ]
             labels, values = zip(*selected)
-            axis.barh(labels, values, color="#3454a5")
+            axis.barh(labels, values, color=THEME["ink"])
             axis.set_title(f"{model} / {workload}", loc="left")
             axis.set_xlabel(ylabel)
             axis.grid(axis="x", alpha=0.2)
             axis.set_axisbelow(True)
         figure.tight_layout()
-        figure.savefig(output / f"{name}.png", dpi=150, bbox_inches="tight")
+        figure.savefig(output / f"{name}.svg", format="svg", bbox_inches="tight")
         plt.close(figure)
     print(output)
 

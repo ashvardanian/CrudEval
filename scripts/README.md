@@ -1,6 +1,7 @@
 # Scripts
 
-`plot.py` reads the JSON reports emitted by the benchmark binaries and produces four PNG figures: successful-entry throughput, operation p99 latency, client RSS, and database size.
+`plot.py` reads the JSON reports emitted by the benchmark binaries and produces four SVG charts: successful-entry throughput, operation p99 latency, client RSS, and database size.
+They use RetriEval's palette, cream marks on a `#C44536` field, so one file reads the same on light and dark pages.
 Each workload gets a separate panel; labels identify the engine, data model, record count, worker count, and configuration hash.
 Only completed phases appear.
 

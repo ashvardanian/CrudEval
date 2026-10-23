@@ -1,4 +1,4 @@
-# Docker configurations
+# Docker
 
 These Compose files provide standalone equivalents of the pinned server images used by the Rust adapters.
 The benchmark binaries manage their own containers directly and do not consume these files or attach to manually started servers.

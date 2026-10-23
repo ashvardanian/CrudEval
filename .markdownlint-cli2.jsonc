@@ -1,0 +1,9 @@
+{
+  // Only the rules worth enforcing on prose; the default set is far too noisy.
+  // MD049/MD050 keep emphasis on underscores, matching the house style.
+  "config": {
+    "default": false,
+    "MD049": { "style": "underscore" },
+    "MD050": { "style": "underscore" }
+  }
+}
