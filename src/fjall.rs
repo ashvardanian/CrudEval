@@ -21,7 +21,7 @@ use serde_json::json;
 
 use crudeval::{
     backend::{
-        directory_bytes, Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, Durability, Key,
+        directory_bytes, Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, Durability, Key, KeyWidth,
         KeysOutput, RecordInput, RecordOutput, Result, TransactionSession,
     },
     run, CommonArgs,
@@ -34,16 +34,18 @@ struct Cli {
 }
 struct FjallBackend {
     db: Database,
+    key_width: KeyWidth,
     records: Keyspace,
     path: PathBuf,
     durability: Durability,
 }
 impl FjallBackend {
-    fn open(path: &Path, durability: Durability) -> Result<Self> {
+    fn open(path: &Path, durability: Durability, key_width: KeyWidth) -> Result<Self> {
         let db = Database::builder(path).open().map_err(|e| e.to_string())?;
         let records = db.keyspace("records", Default::default).map_err(|e| e.to_string())?;
         Ok(Self {
             db,
+            key_width,
             records,
             path: path.into(),
             durability,
@@ -97,7 +99,7 @@ impl BackendSession for FjallSession<'_> {
         for (i, key) in keys.iter().enumerate() {
             batch.insert(
                 &self.0.records,
-                key.as_bytes().as_slice(),
+                self.0.key_width.bytes(key),
                 values.get(i).ok_or("missing input value")?,
             );
         }
@@ -108,7 +110,11 @@ impl BackendSession for FjallSession<'_> {
         output.clear();
         let mut count = 0;
         for key in keys {
-            let value = self.0.records.get(key.as_bytes()).map_err(|e| e.to_string())?;
+            let value = self
+                .0
+                .records
+                .get(self.0.key_width.bytes(key))
+                .map_err(|e| e.to_string())?;
             count += usize::from(value.is_some());
             output.push(value.as_deref())?;
         }
@@ -118,10 +124,15 @@ impl BackendSession for FjallSession<'_> {
         let mut batch = self.0.batch();
         let mut count = 0;
         for (i, key) in keys.iter().enumerate() {
-            if self.0.records.contains_key(key.as_bytes()).map_err(|e| e.to_string())? {
+            if self
+                .0
+                .records
+                .contains_key(self.0.key_width.bytes(key))
+                .map_err(|e| e.to_string())?
+            {
                 batch.insert(
                     &self.0.records,
-                    key.as_bytes().as_slice(),
+                    self.0.key_width.bytes(key),
                     values.get(i).ok_or("missing input value")?,
                 );
                 count += 1;
@@ -134,8 +145,13 @@ impl BackendSession for FjallSession<'_> {
         let mut batch = self.0.batch();
         let mut count = 0;
         for key in keys {
-            if self.0.records.contains_key(key.as_bytes()).map_err(|e| e.to_string())? {
-                batch.remove(&self.0.records, key.as_bytes().as_slice());
+            if self
+                .0
+                .records
+                .contains_key(self.0.key_width.bytes(key))
+                .map_err(|e| e.to_string())?
+            {
+                batch.remove(&self.0.records, self.0.key_width.bytes(key));
                 count += 1;
             }
         }
@@ -151,9 +167,9 @@ impl BackendSession for FjallSession<'_> {
     ) -> Result<usize> {
         keys.clear();
         output.clear();
-        for row in self.0.records.range(start.as_bytes().as_slice()..).take(limit) {
+        for row in self.0.records.range(self.0.key_width.bytes(&start)..).take(limit) {
             let (key, value) = row.into_inner().map_err(|e| e.to_string())?;
-            keys.push(Key::from_slice(&key).map_err(|e| e.to_string())?)?;
+            keys.push(self.0.key_width.from_bytes(&key)?)?;
             output.push(Some(&value))?;
         }
         Ok(keys.len())
@@ -165,7 +181,10 @@ fn main() -> Result<()> {
         if args.data_model != DataModel::KeyValue {
             return Err("fjall supports only kv data_model".into());
         }
-        Ok(Box::new_in(FjallBackend::open(path, args.durability)?, System))
+        Ok(Box::new_in(
+            FjallBackend::open(path, args.durability, args.key_width()?)?,
+            System,
+        ))
     })
 }
 
@@ -177,7 +196,7 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = FjallBackend::open(path, Durability::None).unwrap();
+        let db = FjallBackend::open(path, Durability::None, KeyWidth::U64).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
 }

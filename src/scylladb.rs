@@ -25,8 +25,8 @@ use tokio::runtime::Runtime;
 use crudeval::{
     backend::{
         Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, DocumentInput, DocumentOutput,
-        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeysOutput, RecordInput, RecordOutput, Result,
-        TransactionSession,
+        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeyWidth, KeysOutput, RecordInput, RecordOutput,
+        Result, TransactionSession,
     },
     docker::{ContainerHandle, Startup},
     run, spell_duration, BetweenWorkloads, CommonArgs, Port,
@@ -41,10 +41,10 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
     /// Host port for CQL on localhost; unset lets Docker pick a free one.
-    #[arg(long, value_parser = crudeval::parse_port)]
+    #[arg(long, env = "CRUDEVAL_PORT", value_parser = crudeval::parse_port)]
     port: Option<Port>,
     /// Time limit for container start and readiness, like 120s.
-    #[arg(long, default_value = "120s", value_parser = crudeval::parse_duration_flag)]
+    #[arg(long, env = "CRUDEVAL_STARTUP_TIME_LIMIT", default_value = "120s", value_parser = crudeval::parse_duration_flag)]
     startup_time_limit: Duration,
 }
 struct Statements {
@@ -60,6 +60,7 @@ struct ScyllaBackend {
     session: Session,
     statements: Statements,
     data_model: DataModel,
+    key_width: KeyWidth,
     durability: Durability,
 }
 struct ScyllaSession<'a>(&'a ScyllaBackend);
@@ -151,6 +152,7 @@ fn open(args: &CommonArgs, path: &Path, port: Option<Port>, time_limit: Duration
             session,
             statements,
             data_model: args.data_model,
+            key_width: args.key_width()?,
             durability: args.durability,
         },
         System,
@@ -242,7 +244,7 @@ impl ScyllaBackend {
     ) -> Result<usize> {
         let rows = self
             .session
-            .execute_unpaged(&self.statements.exists, (key.as_bytes().as_slice(),))
+            .execute_unpaged(&self.statements.exists, (self.key_width.bytes(key),))
             .await
             .map_err(|e| e.to_string())?
             .into_rows_result()
@@ -258,7 +260,7 @@ impl ScyllaBackend {
             let mut results = stream::iter(keys)
                 .map(|key| {
                     self.session
-                        .execute_unpaged(&self.statements.read, (key.as_bytes().as_slice(),))
+                        .execute_unpaged(&self.statements.read, (self.key_width.bytes(key),))
                 })
                 .buffered(PIPELINE_DEPTH);
             let mut found = 0;
@@ -283,7 +285,7 @@ impl BackendSession for ScyllaSession<'_> {
         backend.pipelined(keys.iter().enumerate().map(|(i, key)| async move {
             let value = values.get(i).ok_or("Missing insert value")?;
             backend
-                .write(&backend.statements.insert, (key.as_bytes().as_slice(), value))
+                .write(&backend.statements.insert, (backend.key_width.bytes(key), value))
                 .await
         }))
     }
@@ -302,7 +304,7 @@ impl BackendSession for ScyllaSession<'_> {
         backend.pipelined(keys.iter().enumerate().map(|(i, key)| async move {
             let value = values.get(i).ok_or("Missing update value")?;
             backend
-                .write_existing(key, &backend.statements.update, (value, key.as_bytes().as_slice()))
+                .write_existing(key, &backend.statements.update, (value, backend.key_width.bytes(key)))
                 .await
         }))
     }
@@ -310,7 +312,7 @@ impl BackendSession for ScyllaSession<'_> {
         let backend = self.0;
         backend.pipelined(
             keys.iter()
-                .map(|key| backend.write_existing(key, &backend.statements.delete, (key.as_bytes().as_slice(),))),
+                .map(|key| backend.write_existing(key, &backend.statements.delete, (backend.key_width.bytes(key),))),
         )
     }
     fn range_read(&mut self, _: Key, _: usize, _: &mut KeysOutput<'_>, _: &mut RecordOutput<'_>) -> Result<usize> {
@@ -325,7 +327,7 @@ impl DocumentSession for ScyllaSession<'_> {
             backend
                 .write(
                     &backend.statements.insert,
-                    (key.as_bytes().as_slice(), value.score as i64, value.payload),
+                    (backend.key_width.bytes(key), value.score as i64, value.payload),
                 )
                 .await
         }))
@@ -351,7 +353,7 @@ impl DocumentSession for ScyllaSession<'_> {
             backend.write_existing(
                 key,
                 &backend.statements.update,
-                (patch.score as i64, key.as_bytes().as_slice()),
+                (patch.score as i64, backend.key_width.bytes(key)),
             )
         }))
     }

@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use crudeval::{
     backend::{
         Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, DocumentInput, DocumentOutput,
-        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeysOutput, RecordInput, RecordOutput, Result,
-        TransactionSession,
+        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeyWidth, KeysOutput, RecordInput, RecordOutput,
+        Result, TransactionSession,
     },
     docker::ContainerHandle,
     run, BetweenWorkloads, CommonArgs,
@@ -37,10 +37,10 @@ enum Server {
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
-    #[arg(long, value_enum, default_value = "redis")]
+    #[arg(long, env = "CRUDEVAL_SERVER", value_enum, default_value = "redis")]
     server: Server,
     /// Dragonfly I/O threads; defaults to the server's automatic selection.
-    #[arg(long, value_parser = |text: &str| crudeval::parse_count(text).and_then(|count| u16::try_from(count).ok().and_then(NonZeroU16::new)).ok_or("expected a positive count"))]
+    #[arg(long, env = "CRUDEVAL_DRAGONFLY_THREADS", value_parser = |text: &str| crudeval::parse_count(text).and_then(|count| u16::try_from(count).ok().and_then(NonZeroU16::new)).ok_or("expected a positive count"))]
     dragonfly_threads: Option<NonZeroU16>,
 }
 struct RedisBackend {
@@ -51,11 +51,13 @@ struct RedisBackend {
     image: &'static str,
     dragonfly_threads: Option<NonZeroU16>,
     data_model: DataModel,
+    key_width: KeyWidth,
 }
 struct RedisSession {
     server: Server,
     connection: Connection,
     data_model: DataModel,
+    key_width: KeyWidth,
     pipeline: redis::Pipeline,
     wire: Vec<u8, System>,
 }
@@ -208,6 +210,7 @@ fn open(
             image,
             dragonfly_threads,
             data_model: args.data_model,
+            key_width: args.key_width()?,
         },
         System,
     ))
@@ -259,6 +262,7 @@ impl Backend for RedisBackend {
                 server: self.server,
                 connection: self.client.get_connection().map_err(|e| e.to_string())?,
                 data_model: self.data_model,
+                key_width: self.key_width,
                 pipeline: redis::pipe(),
                 wire: Vec::new_in(System),
             },
@@ -294,7 +298,7 @@ impl BackendSession for RedisSession {
         for (i, key) in keys.iter().enumerate() {
             self.pipeline
                 .cmd("SET")
-                .arg(key.as_bytes().as_slice())
+                .arg(self.key_width.bytes(key))
                 .arg(values.get(i).ok_or("Missing insert value")?)
                 .arg("NX");
         }
@@ -308,7 +312,7 @@ impl BackendSession for RedisSession {
         }
         let mut cmd = redis::cmd("MGET");
         for key in keys {
-            cmd.arg(key.as_bytes().as_slice());
+            cmd.arg(self.key_width.bytes(key));
         }
         let values: Vec<Option<Vec<u8>>> = cmd.query(&mut self.connection).map_err(|e| e.to_string())?;
         let mut found = 0;
@@ -323,7 +327,7 @@ impl BackendSession for RedisSession {
         for (i, key) in keys.iter().enumerate() {
             self.pipeline
                 .cmd("SET")
-                .arg(key.as_bytes().as_slice())
+                .arg(self.key_width.bytes(key))
                 .arg(values.get(i).ok_or("Missing update value")?)
                 .arg("XX");
         }
@@ -336,7 +340,7 @@ impl BackendSession for RedisSession {
         }
         let mut cmd = redis::cmd("DEL");
         for key in keys {
-            cmd.arg(key.as_bytes().as_slice());
+            cmd.arg(self.key_width.bytes(key));
         }
         cmd.query(&mut self.connection).map_err(|e| e.to_string())
     }
@@ -366,7 +370,7 @@ impl DocumentSession for RedisSession {
             .map_err(|e| e.to_string())?;
             self.pipeline
                 .cmd("JSON.SET")
-                .arg(key.as_bytes().as_slice())
+                .arg(self.key_width.bytes(key))
                 .arg("$")
                 .arg(self.wire.as_slice());
             if !matches!(self.server, Server::Kvrocks) {
@@ -384,13 +388,13 @@ impl DocumentSession for RedisSession {
         }
         let results: Vec<Option<Vec<u8>>> = if matches!(self.server, Server::Garnet) {
             for key in keys {
-                self.pipeline.cmd("JSON.GET").arg(key.as_bytes().as_slice()).arg("$");
+                self.pipeline.cmd("JSON.GET").arg(self.key_width.bytes(key)).arg("$");
             }
             self.pipeline.query(&mut self.connection).map_err(|e| e.to_string())?
         } else {
             let mut command = redis::cmd("JSON.MGET");
             for key in keys {
-                command.arg(key.as_bytes().as_slice());
+                command.arg(self.key_width.bytes(key));
             }
             command.arg("$");
             command.query(&mut self.connection).map_err(|e| e.to_string())?
@@ -417,11 +421,11 @@ impl DocumentSession for RedisSession {
                 self.server,
                 Server::Kvrocks | Server::Valkey | Server::Dragonfly | Server::Garnet
             ) {
-                self.pipeline.cmd("EVAL").arg("if redis.call('EXISTS',KEYS[1]) == 0 then return false end return redis.call('JSON.SET',KEYS[1],'$.score',ARGV[1])").arg(1).arg(key.as_bytes().as_slice()).arg(patch.score);
+                self.pipeline.cmd("EVAL").arg("if redis.call('EXISTS',KEYS[1]) == 0 then return false end return redis.call('JSON.SET',KEYS[1],'$.score',ARGV[1])").arg(1).arg(self.key_width.bytes(key)).arg(patch.score);
             } else {
                 self.pipeline
                     .cmd("JSON.SET")
-                    .arg(key.as_bytes().as_slice())
+                    .arg(self.key_width.bytes(key))
                     .arg("$.score")
                     .arg(patch.score)
                     .arg("XX");

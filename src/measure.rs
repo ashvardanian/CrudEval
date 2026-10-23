@@ -60,6 +60,11 @@ impl Default for WorkloadMeasurements {
     }
 }
 impl WorkloadMeasurements {
+    /// Passes `verified` through, counting a failed verification as corruption.
+    pub fn count_corruption(&mut self, verified: Result<()>) -> Result<()> {
+        self.corrupted += u64::from(verified.is_err());
+        verified
+    }
     pub fn new(
         operations: impl IntoIterator<Item = Operation>,
         transaction: bool,

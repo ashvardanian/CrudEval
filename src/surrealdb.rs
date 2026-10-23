@@ -47,6 +47,8 @@ struct SurrealSession {
     url: String,
     data_model: DataModel,
     edges: Vec<GraphEdge, System>,
+    vertex_writes: Vec<VertexWrite, System>,
+    edge_writes: Vec<EdgeWrite, System>,
 }
 #[derive(Serialize)]
 struct RpcRequest<'a, P> {
@@ -126,6 +128,8 @@ impl SurrealSession {
             url,
             data_model,
             edges: Vec::new_in(System),
+            vertex_writes: Vec::new_in(System),
+            edge_writes: Vec::new_in(System),
         }
     }
     fn query<T: DeserializeOwned, P: Serialize>(&self, sql: &str, params: P) -> Result<T> {
@@ -423,11 +427,10 @@ impl GraphSession for SurrealSession {
             vertices: &'a [VertexWrite],
             edges: &'a [EdgeWrite],
         }
-        let mut vertices = Vec::new_in(System);
-        let mut edges = Vec::new_in(System);
         let mut start = 0;
         let mut total = 0;
         while start < keys.len() {
+            let (vertices, edges) = (&mut self.vertex_writes, &mut self.edge_writes);
             vertices.clear();
             edges.clear();
             let mut bytes = 0;
@@ -453,8 +456,8 @@ impl GraphSession for SurrealSession {
                     target: e.target,
                 }));
             }
-            total+=self.query::<usize,_>("BEGIN TRANSACTION; LET $new=(INSERT IGNORE INTO vertex $vertices RETURN id); LET $relations=$edges.filter(|$edge| type::record('vertex',$edge.source) IN $new.id).map(|$edge| {id:type::record('edge',[$edge.source,$edge.slot]),in:type::record('vertex',$edge.source),out:type::record('vertex',$edge.target),slot:$edge.slot}); LET $inserted=(INSERT RELATION INTO edge $relations RETURN NONE); RETURN count($new); COMMIT TRANSACTION;",Params {vertices:&vertices,edges:&edges})?;
-            start += vertices.len();
+            total+=self.query::<usize,_>("BEGIN TRANSACTION; LET $new=(INSERT IGNORE INTO vertex $vertices RETURN id); LET $relations=$edges.filter(|$edge| type::record('vertex',$edge.source) IN $new.id).map(|$edge| {id:type::record('edge',[$edge.source,$edge.slot]),in:type::record('vertex',$edge.source),out:type::record('vertex',$edge.target),slot:$edge.slot}); LET $inserted=(INSERT RELATION INTO edge $relations RETURN NONE); RETURN count($new); COMMIT TRANSACTION;",Params {vertices:&self.vertex_writes,edges:&self.edge_writes})?;
+            start += self.vertex_writes.len();
         }
         Ok(total)
     }

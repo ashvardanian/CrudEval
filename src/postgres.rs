@@ -19,7 +19,7 @@ use crudeval::{
     backend::{
         Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, DocumentInput, DocumentOutput,
         DocumentPatch, DocumentRef, DocumentSession, Durability, GraphEdge, GraphInput, GraphOutput, GraphPatch,
-        GraphSession, Key, KeysOutput, RecordInput, RecordOutput, Result, TransactionSession, VertexRef,
+        GraphSession, Key, KeyWidth, KeysOutput, RecordInput, RecordOutput, Result, TransactionSession, VertexRef,
     },
     docker::ContainerHandle,
     run, BetweenWorkloads, CommonArgs,
@@ -34,15 +34,29 @@ struct PostgresBackend {
     container: ContainerHandle,
     url: String,
     data_model: DataModel,
+    key_width: KeyWidth,
     durability: Durability,
 }
 struct PostgresSession {
     client: Client,
     data_model: DataModel,
+    key_width: KeyWidth,
     transaction: bool,
     statements: BTreeMap<&'static str, postgres::Statement>,
     edges: Vec<GraphEdge, System>,
 }
+const KEY_VALUE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS records (id bytea PRIMARY KEY, value bytea NOT NULL)";
+const DOCUMENTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS records (id bytea PRIMARY KEY, value jsonb NOT NULL)";
+const GRAPH_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS records (id bytea PRIMARY KEY, version bigint NOT NULL);
+    CREATE TABLE IF NOT EXISTS edges (
+        source bytea NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+        slot integer NOT NULL,
+        target bytea NOT NULL,
+        PRIMARY KEY (source, slot)
+    );
+    CREATE INDEX IF NOT EXISTS edges_target ON edges(target)";
+
 fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
     if args.between_workloads != BetweenWorkloads::Keep {
         return Err("Docker backends support only --between-workloads keep".into());
@@ -77,13 +91,18 @@ fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
     );
     container.ready(|| Client::connect(&url, NoTls).map(|_| ()).map_err(|e| format!("{e:?}")))?;
     let mut client = Client::connect(&url, NoTls).map_err(|e| format!("{e:?}"))?;
-    let schema=match args.data_model { DataModel::KeyValue=>"CREATE TABLE IF NOT EXISTS records (id bytea PRIMARY KEY, value bytea NOT NULL)",DataModel::Documents=>"CREATE TABLE IF NOT EXISTS records (id bytea PRIMARY KEY, value jsonb NOT NULL)",DataModel::Graph=>"CREATE TABLE IF NOT EXISTS records (id bytea PRIMARY KEY, version bigint NOT NULL); CREATE TABLE IF NOT EXISTS edges (source bytea NOT NULL REFERENCES records(id) ON DELETE CASCADE, slot integer NOT NULL, target bytea NOT NULL, PRIMARY KEY(source,slot)); CREATE INDEX IF NOT EXISTS edges_target ON edges(target)"};
+    let schema = match args.data_model {
+        DataModel::KeyValue => KEY_VALUE_SCHEMA,
+        DataModel::Documents => DOCUMENTS_SCHEMA,
+        DataModel::Graph => GRAPH_SCHEMA,
+    };
     client.batch_execute(schema).map_err(|e| format!("{e:?}"))?;
     Ok(Box::new_in(
         PostgresBackend {
             container,
             url,
             data_model: args.data_model,
+            key_width: args.key_width()?,
             durability: args.durability,
         },
         System,
@@ -124,6 +143,7 @@ impl Backend for PostgresBackend {
             PostgresSession {
                 client: Client::connect(&self.url, NoTls).map_err(|e| format!("{e:?}"))?,
                 data_model: self.data_model,
+                key_width: self.key_width,
                 transaction: false,
                 statements: BTreeMap::new(),
                 edges: Vec::new_in(System),
@@ -177,7 +197,7 @@ impl PostgresSession {
             for (target, slot) in targets.iter().zip(slots) {
                 self.edges.push(GraphEdge {
                     slot: slot as u32,
-                    target: Key::from_slice(target).map_err(|e| e.to_string())?,
+                    target: self.key_width.from_bytes(target)?,
                 });
             }
             out.push(Some(VertexRef {
@@ -189,9 +209,9 @@ impl PostgresSession {
         }
     }
 }
-fn key_bytes(keys: &[Key]) -> Vec<&[u8], System> {
+fn key_bytes(key_width: KeyWidth, keys: &[Key]) -> Vec<&[u8], System> {
     let mut bytes = Vec::with_capacity_in(keys.len(), System);
-    bytes.extend(keys.iter().map(|key| key.as_bytes().as_slice()));
+    bytes.extend(keys.iter().map(|key| key_width.bytes(key)));
     bytes
 }
 impl TransactionSession for PostgresSession {
@@ -219,7 +239,7 @@ impl BackendSession for PostgresSession {
         (self.data_model == DataModel::Graph).then_some(self)
     }
     fn insert(&mut self, keys: &[Key], values: &RecordInput<'_>) -> Result<usize> {
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         let mut wire_values = Vec::with_capacity_in(keys.len(), System);
         for i in 0..keys.len() {
             wire_values.push(values.get(i).ok_or("Missing value")?);
@@ -231,7 +251,7 @@ impl BackendSession for PostgresSession {
     }
     fn read(&mut self, keys: &[Key], out: &mut RecordOutput<'_>) -> Result<usize> {
         out.clear();
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         let rows=self.query("SELECT r.value FROM unnest($1::bytea[]) WITH ORDINALITY q(id,n) LEFT JOIN records r ON r.id=q.id ORDER BY q.n",&[&ids.as_slice()])?;
         let mut found = 0;
         for row in rows {
@@ -242,7 +262,7 @@ impl BackendSession for PostgresSession {
         Ok(found)
     }
     fn update(&mut self, keys: &[Key], values: &RecordInput<'_>) -> Result<usize> {
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         let mut wire_values = Vec::with_capacity_in(keys.len(), System);
         for i in 0..keys.len() {
             wire_values.push(values.get(i).ok_or("Missing value")?);
@@ -253,7 +273,7 @@ impl BackendSession for PostgresSession {
         )
     }
     fn delete(&mut self, keys: &[Key]) -> Result<usize> {
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         self.execute(if self.data_model==DataModel::Graph {"WITH incoming AS (DELETE FROM edges WHERE target=ANY($1::bytea[])) DELETE FROM records WHERE id=ANY($1::bytea[])"}else{"DELETE FROM records WHERE id=ANY($1::bytea[])"},&[&ids.as_slice()])
     }
     fn range_read(
@@ -267,10 +287,10 @@ impl BackendSession for PostgresSession {
         out.clear();
         let rows = self.query(
             "SELECT id,value FROM records WHERE id >= $1 ORDER BY id LIMIT $2",
-            &[&start.as_bytes().as_slice(), &(limit as i64)],
+            &[&self.key_width.bytes(&start), &(limit as i64)],
         )?;
         for row in rows {
-            keys.push(Key::from_slice(row.get(0)).map_err(|e| e.to_string())?)?;
+            keys.push(self.key_width.from_bytes(row.get(0))?)?;
             out.push(Some(row.get(1)))?;
         }
         Ok(keys.len())
@@ -278,7 +298,7 @@ impl BackendSession for PostgresSession {
 }
 impl DocumentSession for PostgresSession {
     fn insert(&mut self, keys: &[Key], values: &DocumentInput<'_>) -> Result<usize> {
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         let mut scores = Vec::with_capacity_in(keys.len(), System);
         let mut payloads = Vec::with_capacity_in(keys.len(), System);
         for i in 0..keys.len() {
@@ -290,7 +310,7 @@ impl DocumentSession for PostgresSession {
     }
     fn read(&mut self, keys: &[Key], out: &mut DocumentOutput<'_>) -> Result<usize> {
         out.clear();
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         let rows=self.query("SELECT (r.value->>'score')::bigint,r.value->>'payload' FROM unnest($1::bytea[]) WITH ORDINALITY q(id,n) LEFT JOIN records r ON r.id=q.id ORDER BY q.n",&[&ids.as_slice()])?;
         let mut found = 0;
         for row in rows {
@@ -308,7 +328,7 @@ impl DocumentSession for PostgresSession {
         Ok(found)
     }
     fn update(&mut self, keys: &[Key], patches: &[DocumentPatch]) -> Result<usize> {
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         let mut scores = Vec::with_capacity_in(patches.len(), System);
         scores.extend(patches.iter().map(|p| p.score as i64));
         self.execute("UPDATE records r SET value=jsonb_set(r.value,'{score}',to_jsonb(q.score)) FROM unnest($1::bytea[],$2::bigint[]) q(id,score) WHERE r.id=q.id",&[&ids.as_slice(),&scores.as_slice()])
@@ -327,10 +347,10 @@ impl DocumentSession for PostgresSession {
         out.clear();
         let rows = self.query(
             "SELECT id,(value->>'score')::bigint,value->>'payload' FROM records WHERE id >= $1 ORDER BY id LIMIT $2",
-            &[&start.as_bytes().as_slice(), &(limit as i64)],
+            &[&self.key_width.bytes(&start), &(limit as i64)],
         )?;
         for row in rows {
-            keys.push(Key::from_slice(row.get(0)).map_err(|e| e.to_string())?)?;
+            keys.push(self.key_width.from_bytes(row.get(0))?)?;
             out.push(Some(DocumentRef {
                 score: row.get::<_, i64>(1) as u64,
                 payload: row.get(2),
@@ -341,18 +361,22 @@ impl DocumentSession for PostgresSession {
 }
 impl GraphSession for PostgresSession {
     fn insert(&mut self, keys: &[Key], values: &GraphInput<'_>) -> Result<usize> {
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
+        let edges: usize = (0..keys.len())
+            .filter_map(|i| values.get(i))
+            .map(|value| value.edges.len())
+            .sum();
         let mut versions = Vec::with_capacity_in(keys.len(), System);
-        let mut sources = Vec::new_in(System);
-        let mut slots = Vec::new_in(System);
-        let mut targets = Vec::new_in(System);
+        let mut sources = Vec::with_capacity_in(edges, System);
+        let mut slots = Vec::with_capacity_in(edges, System);
+        let mut targets = Vec::with_capacity_in(edges, System);
         for (i, key) in keys.iter().enumerate() {
             let value = values.get(i).ok_or("Missing vertex")?;
             versions.push(value.version as i64);
             for edge in value.edges {
-                sources.push(key.as_bytes().as_slice());
+                sources.push(self.key_width.bytes(key));
                 slots.push(edge.slot as i32);
-                targets.push(edge.target.as_bytes().as_slice());
+                targets.push(self.key_width.bytes(&edge.target));
             }
         }
         let rows=self.query("WITH vertices AS (INSERT INTO records SELECT * FROM unnest($1::bytea[],$2::bigint[]) ON CONFLICT DO NOTHING RETURNING id), links AS (INSERT INTO edges SELECT q.source,q.slot,q.target FROM unnest($3::bytea[],$4::int[],$5::bytea[]) q(source,slot,target) JOIN vertices v ON v.id=q.source) SELECT count(*) FROM vertices",&[&ids.as_slice(),&versions.as_slice(),&sources.as_slice(),&slots.as_slice(),&targets.as_slice()])?;
@@ -360,7 +384,7 @@ impl GraphSession for PostgresSession {
     }
     fn read(&mut self, keys: &[Key], out: &mut GraphOutput<'_>) -> Result<usize> {
         out.clear();
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         let rows=self.query("SELECT r.id,r.version,ARRAY(SELECT target FROM edges WHERE source=r.id ORDER BY slot),ARRAY(SELECT slot FROM edges WHERE source=r.id ORDER BY slot) FROM unnest($1::bytea[]) WITH ORDINALITY q(id,n) LEFT JOIN records r ON r.id=q.id ORDER BY q.n",&[&ids.as_slice()])?;
         let mut found = 0;
         for row in rows {
@@ -370,14 +394,14 @@ impl GraphSession for PostgresSession {
         Ok(found)
     }
     fn update(&mut self, keys: &[Key], patches: &[GraphPatch]) -> Result<usize> {
-        let ids = key_bytes(keys);
+        let ids = key_bytes(self.key_width, keys);
         let mut versions = Vec::with_capacity_in(patches.len(), System);
         versions.extend(patches.iter().map(|p| p.version as i64));
         let mut targets = Vec::with_capacity_in(patches.len(), System);
         targets.extend(
             patches
                 .iter()
-                .map(|p| p.neighbor.as_ref().map(|key| key.as_bytes().as_slice())),
+                .map(|p| p.neighbor.as_ref().map(|key| self.key_width.bytes(key))),
         );
         let rows=self.query("WITH input AS (SELECT * FROM unnest($1::bytea[],$2::bigint[],$3::bytea[]) q(id,version,target)), vertices AS (UPDATE records r SET version=q.version FROM input q WHERE r.id=q.id RETURNING r.id), removed AS (DELETE FROM edges e USING input q,vertices v WHERE e.source=q.id AND v.id=q.id AND e.slot=0 AND q.target IS NULL), links AS (INSERT INTO edges SELECT q.id,0,q.target FROM input q JOIN vertices v ON v.id=q.id WHERE q.target IS NOT NULL ON CONFLICT(source,slot) DO UPDATE SET target=excluded.target) SELECT count(*) FROM vertices",&[&ids.as_slice(),&versions.as_slice(),&targets.as_slice()])?;
         Ok(rows[0].get::<_, i64>(0) as usize)
@@ -394,18 +418,18 @@ impl GraphSession for PostgresSession {
     ) -> Result<usize> {
         keys.clear();
         out.clear();
-        let rows=self.query("SELECT id,version,ARRAY(SELECT target FROM edges WHERE source=r.id ORDER BY slot),ARRAY(SELECT slot FROM edges WHERE source=r.id ORDER BY slot) FROM records r WHERE id >= $1 ORDER BY id LIMIT $2",&[&start.as_bytes().as_slice(),&(limit as i64)])?;
+        let rows=self.query("SELECT id,version,ARRAY(SELECT target FROM edges WHERE source=r.id ORDER BY slot),ARRAY(SELECT slot FROM edges WHERE source=r.id ORDER BY slot) FROM records r WHERE id >= $1 ORDER BY id LIMIT $2",&[&self.key_width.bytes(&start),&(limit as i64)])?;
         for row in rows {
-            keys.push(Key::from_slice(row.get(0)).map_err(|e| e.to_string())?)?;
+            keys.push(self.key_width.from_bytes(row.get(0))?)?;
             self.graph_row(&row, out)?;
         }
         Ok(keys.len())
     }
     fn expand_neighbors(&mut self, start: Key, limit: usize, keys: &mut KeysOutput<'_>) -> Result<usize> {
         keys.clear();
-        let rows=self.query("SELECT DISTINCT b.target FROM edges a JOIN edges b ON a.target=b.source WHERE a.source=$1 AND b.target<>$1 ORDER BY b.target LIMIT $2",&[&start.as_bytes().as_slice(),&(limit as i64)])?;
+        let rows=self.query("SELECT DISTINCT b.target FROM edges a JOIN edges b ON a.target=b.source WHERE a.source=$1 AND b.target<>$1 ORDER BY b.target LIMIT $2",&[&self.key_width.bytes(&start),&(limit as i64)])?;
         for row in rows {
-            keys.push(Key::from_slice(row.get(0)).map_err(|e| e.to_string())?)?;
+            keys.push(self.key_width.from_bytes(row.get(0))?)?;
         }
         Ok(keys.len())
     }

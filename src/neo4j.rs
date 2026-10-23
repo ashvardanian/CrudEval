@@ -34,7 +34,7 @@ enum Server {
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
-    #[arg(long, value_enum, default_value = "neo4j")]
+    #[arg(long, env = "CRUDEVAL_SERVER", value_enum, default_value = "neo4j")]
     server: Server,
 }
 struct Neo4jBackend {

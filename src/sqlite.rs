@@ -24,8 +24,8 @@ use serde_json::json;
 use crudeval::{
     backend::{
         directory_bytes, Backend, BackendCapabilities, BackendSession, DataModel, DocumentInput, DocumentOutput,
-        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeysOutput, RecordInput, RecordOutput, Result,
-        TransactionSession,
+        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeyWidth, KeysOutput, RecordInput, RecordOutput,
+        Result, TransactionSession,
     },
     run, Bytes, CommonArgs,
 };
@@ -35,19 +35,21 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
     /// Page cache per session, like 64MB.
-    #[arg(long, default_value = "64MB", value_parser = crudeval::workload::parse_size)]
+    #[arg(long, env = "CRUDEVAL_CACHE_SIZE", default_value = "64MB", value_parser = crudeval::workload::parse_size)]
     cache_size: Bytes,
 }
 
 struct SqliteBackend {
     path: PathBuf,
     durability: Durability,
+    key_width: KeyWidth,
     docs: bool,
     cache_size: u64,
     keeper: Mutex<Connection>,
 }
 struct SqliteSession {
     connection: Connection,
+    key_width: KeyWidth,
     docs: bool,
 }
 impl SqliteBackend {
@@ -72,7 +74,7 @@ impl SqliteBackend {
             .map_err(|e| e.to_string())?;
         Ok(connection)
     }
-    fn open(path: &Path, durability: Durability, docs: bool, cache_size: u64) -> Result<Self> {
+    fn open(path: &Path, durability: Durability, key_width: KeyWidth, docs: bool, cache_size: u64) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let path = path.join("sqlite.db");
         let keeper = Connection::open(&path).map_err(|e| e.to_string())?;
@@ -83,6 +85,7 @@ impl SqliteBackend {
         Ok(Self {
             path,
             durability,
+            key_width,
             docs,
             cache_size,
             keeper: Mutex::new(keeper),
@@ -125,6 +128,7 @@ impl Backend for SqliteBackend {
         Ok(Box::new_in(
             SqliteSession {
                 connection: self.connect()?,
+                key_width: self.key_width,
                 docs: self.docs,
             },
             System,
@@ -161,7 +165,7 @@ impl BackendSession for SqliteSession {
             .map_err(|e| e.to_string())?;
         for (i, key) in keys.iter().enumerate() {
             statement
-                .execute(params![key.as_bytes().as_slice(), values.get(i)])
+                .execute(params![self.key_width.bytes(key), values.get(i)])
                 .map_err(|e| e.to_string())?;
         }
         drop(statement);
@@ -179,7 +183,7 @@ impl BackendSession for SqliteSession {
         let mut found = 0;
         for key in keys {
             let mut rows = statement
-                .query([key.as_bytes().as_slice()])
+                .query([self.key_width.bytes(key)])
                 .map_err(|e| e.to_string())?;
             if let Some(row) = rows.next().map_err(|e| e.to_string())? {
                 let value = row
@@ -205,7 +209,7 @@ impl BackendSession for SqliteSession {
         let mut count = 0;
         for (i, key) in keys.iter().enumerate() {
             count += statement
-                .execute(params![key.as_bytes().as_slice(), values.get(i)])
+                .execute(params![self.key_width.bytes(key), values.get(i)])
                 .map_err(|e| e.to_string())?;
         }
         drop(statement);
@@ -226,7 +230,7 @@ impl BackendSession for SqliteSession {
         let mut count = 0;
         for key in keys {
             count += statement
-                .execute([key.as_bytes().as_slice()])
+                .execute([self.key_width.bytes(key)])
                 .map_err(|e| e.to_string())?;
         }
         drop(statement);
@@ -250,7 +254,7 @@ impl BackendSession for SqliteSession {
             .map_err(|e| e.to_string())?;
         let mut rows = statement
             .query(params![
-                start.as_bytes().as_slice(),
+                self.key_width.bytes(&start),
                 i64::try_from(limit).unwrap_or(i64::MAX)
             ])
             .map_err(|e| e.to_string())?;
@@ -265,7 +269,7 @@ impl BackendSession for SqliteSession {
                 .map_err(|e| e.to_string())?
                 .as_bytes()
                 .map_err(|e| e.to_string())?;
-            keys.push(Key::from_slice(key).map_err(|e| e.to_string())?)?;
+            keys.push(self.key_width.from_bytes(key)?)?;
             output.push(Some(value))?;
         }
         Ok(keys.len())
@@ -302,7 +306,7 @@ impl DocumentSession for SqliteSession {
             let value = values.get(index).ok_or("missing input document")?;
             statement
                 .execute(params![
-                    key.as_bytes().as_slice(),
+                    self.key_width.bytes(key),
                     key.hyphenated().encode_lower(&mut uuid) as &str,
                     i64::try_from(value.score).map_err(|e| e.to_string())?,
                     value.payload
@@ -326,7 +330,7 @@ impl DocumentSession for SqliteSession {
         let mut count = 0;
         for key in keys {
             let mut rows = statement
-                .query([key.as_bytes().as_slice()])
+                .query([self.key_width.bytes(key)])
                 .map_err(|e| e.to_string())?;
             if let Some(row) = rows.next().map_err(|e| e.to_string())? {
                 let score =
@@ -360,7 +364,7 @@ impl DocumentSession for SqliteSession {
         for (key, patch) in keys.iter().zip(patches) {
             count += statement
                 .execute(params![
-                    key.as_bytes().as_slice(),
+                    self.key_width.bytes(key),
                     i64::try_from(patch.score).map_err(|e| e.to_string())?
                 ])
                 .map_err(|e| e.to_string())?;
@@ -388,7 +392,7 @@ impl DocumentSession for SqliteSession {
         ).map_err(|e| e.to_string())?;
         let mut rows = statement
             .query(params![
-                start.as_bytes().as_slice(),
+                self.key_width.bytes(&start),
                 i64::try_from(limit).map_err(|e| e.to_string())?
             ])
             .map_err(|e| e.to_string())?;
@@ -404,7 +408,7 @@ impl DocumentSession for SqliteSession {
                 .map_err(|e| e.to_string())?
                 .as_str()
                 .map_err(|e| e.to_string())?;
-            keys.push(Key::from_slice(key).map_err(|e| e.to_string())?)?;
+            keys.push(self.key_width.from_bytes(key)?)?;
             output.push(Some(DocumentRef { score, payload }))?;
         }
         Ok(keys.len())
@@ -426,6 +430,7 @@ fn main() -> Result<()> {
                 SqliteBackend::open(
                     path,
                     args.durability,
+                    args.key_width()?,
                     args.data_model == DataModel::Documents,
                     cli.cache_size.0,
                 )?,
@@ -443,14 +448,14 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = SqliteBackend::open(path, Durability::None, false, 8).unwrap();
+        let db = SqliteBackend::open(path, Durability::None, KeyWidth::U64, false, 8).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
 
     #[test]
     fn document_update_and_rollback() {
         let directory = tempfile::tempdir().unwrap();
-        let db = SqliteBackend::open(directory.path(), Durability::Flushed, true, 8).unwrap();
+        let db = SqliteBackend::open(directory.path(), Durability::Flushed, KeyWidth::U64, true, 8).unwrap();
         let mut session = db.session().unwrap();
         let session = session.documents().unwrap();
         let key = Key::from_u128(1);

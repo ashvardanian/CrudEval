@@ -21,8 +21,8 @@ use serde_json::json;
 
 use crudeval::{
     backend::{
-        directory_bytes, Backend, BackendCapabilities, BackendSession, DataModel, Durability, Key, KeysOutput,
-        RecordInput, RecordOutput, Result, TransactionSession,
+        directory_bytes, Backend, BackendCapabilities, BackendSession, DataModel, Durability, Key, KeyWidth,
+        KeysOutput, RecordInput, RecordOutput, Result, TransactionSession,
     },
     run, CommonArgs,
 };
@@ -35,11 +35,12 @@ struct Cli {
 }
 struct RedbBackend {
     db: Database,
+    key_width: KeyWidth,
     path: PathBuf,
     durability: Durability,
 }
 impl RedbBackend {
-    fn open(path: &Path, durability: Durability) -> Result<Self> {
+    fn open(path: &Path, durability: Durability, key_width: KeyWidth) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let db = Database::create(path.join("redb.db")).map_err(|e| e.to_string())?;
         let tx = db.begin_write().map_err(|e| e.to_string())?;
@@ -47,6 +48,7 @@ impl RedbBackend {
         tx.commit().map_err(|e| e.to_string())?;
         Ok(Self {
             db,
+            key_width,
             path: path.into(),
             durability,
         })
@@ -123,13 +125,14 @@ impl RedbSession<'_> {
 }
 fn read_rows(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    key_width: KeyWidth,
     keys: &[Key],
     output: &mut RecordOutput<'_>,
 ) -> Result<usize> {
     output.clear();
     let mut count = 0;
     for key in keys {
-        let value = table.get(key.as_bytes().as_slice()).map_err(|e| e.to_string())?;
+        let value = table.get(key_width.bytes(key)).map_err(|e| e.to_string())?;
         count += usize::from(value.is_some());
         output.push(value.as_ref().map(|v| v.value()))?;
     }
@@ -137,6 +140,7 @@ fn read_rows(
 }
 fn scan_rows(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    key_width: KeyWidth,
     start: Key,
     limit: usize,
     keys: &mut KeysOutput<'_>,
@@ -145,23 +149,24 @@ fn scan_rows(
     keys.clear();
     output.clear();
     for row in table
-        .range(start.as_bytes().as_slice()..)
+        .range(key_width.bytes(&start)..)
         .map_err(|e| e.to_string())?
         .take(limit)
     {
         let (key, value) = row.map_err(|e| e.to_string())?;
-        keys.push(Key::from_slice(key.value()).map_err(|e| e.to_string())?)?;
+        keys.push(key_width.from_bytes(key.value())?)?;
         output.push(Some(value.value()))?;
     }
     Ok(keys.len())
 }
 impl BackendSession for RedbSession<'_> {
     fn insert(&mut self, keys: &[Key], values: &RecordInput<'_>) -> Result<usize> {
+        let key_width = self.backend.key_width;
         self.write(|tx| {
             let mut table = tx.open_table(RECORDS).map_err(|e| e.to_string())?;
             for (i, key) in keys.iter().enumerate() {
                 table
-                    .insert(key.as_bytes().as_slice(), values.get(i).ok_or("missing input value")?)
+                    .insert(key_width.bytes(key), values.get(i).ok_or("missing input value")?)
                     .map_err(|e| e.to_string())?;
             }
             Ok(keys.len())
@@ -169,23 +174,31 @@ impl BackendSession for RedbSession<'_> {
     }
     fn read(&mut self, keys: &[Key], output: &mut RecordOutput<'_>) -> Result<usize> {
         if let Some(tx) = &self.transaction {
-            return read_rows(&tx.open_table(RECORDS).map_err(|e| e.to_string())?, keys, output);
+            return read_rows(
+                &tx.open_table(RECORDS).map_err(|e| e.to_string())?,
+                self.backend.key_width,
+                keys,
+                output,
+            );
         }
         let tx = self.backend.db.begin_read().map_err(|e| e.to_string())?;
-        read_rows(&tx.open_table(RECORDS).map_err(|e| e.to_string())?, keys, output)
+        read_rows(
+            &tx.open_table(RECORDS).map_err(|e| e.to_string())?,
+            self.backend.key_width,
+            keys,
+            output,
+        )
     }
     fn update(&mut self, keys: &[Key], values: &RecordInput<'_>) -> Result<usize> {
+        let key_width = self.backend.key_width;
         self.write(|tx| {
             let mut table = tx.open_table(RECORDS).map_err(|e| e.to_string())?;
             let mut count = 0;
             for (i, key) in keys.iter().enumerate() {
-                let exists = table
-                    .get(key.as_bytes().as_slice())
-                    .map_err(|e| e.to_string())?
-                    .is_some();
+                let exists = table.get(key_width.bytes(key)).map_err(|e| e.to_string())?.is_some();
                 if exists {
                     table
-                        .insert(key.as_bytes().as_slice(), values.get(i).ok_or("missing input value")?)
+                        .insert(key_width.bytes(key), values.get(i).ok_or("missing input value")?)
                         .map_err(|e| e.to_string())?;
                     count += 1;
                 }
@@ -194,16 +207,12 @@ impl BackendSession for RedbSession<'_> {
         })
     }
     fn delete(&mut self, keys: &[Key]) -> Result<usize> {
+        let key_width = self.backend.key_width;
         self.write(|tx| {
             let mut table = tx.open_table(RECORDS).map_err(|e| e.to_string())?;
             let mut count = 0;
             for key in keys {
-                count += usize::from(
-                    table
-                        .remove(key.as_bytes().as_slice())
-                        .map_err(|e| e.to_string())?
-                        .is_some(),
-                );
+                count += usize::from(table.remove(key_width.bytes(key)).map_err(|e| e.to_string())?.is_some());
             }
             Ok(count)
         })
@@ -218,6 +227,7 @@ impl BackendSession for RedbSession<'_> {
         if let Some(tx) = &self.transaction {
             return scan_rows(
                 &tx.open_table(RECORDS).map_err(|e| e.to_string())?,
+                self.backend.key_width,
                 start,
                 limit,
                 keys,
@@ -227,6 +237,7 @@ impl BackendSession for RedbSession<'_> {
         let tx = self.backend.db.begin_read().map_err(|e| e.to_string())?;
         scan_rows(
             &tx.open_table(RECORDS).map_err(|e| e.to_string())?,
+            self.backend.key_width,
             start,
             limit,
             keys,
@@ -265,7 +276,10 @@ fn main() -> Result<()> {
         if args.data_model != DataModel::KeyValue {
             return Err("redb supports only kv data_model".into());
         }
-        Ok(Box::new_in(RedbBackend::open(path, args.durability)?, System))
+        Ok(Box::new_in(
+            RedbBackend::open(path, args.durability, args.key_width()?)?,
+            System,
+        ))
     })
 }
 
@@ -277,7 +291,7 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = RedbBackend::open(path, Durability::None).unwrap();
+        let db = RedbBackend::open(path, Durability::None, KeyWidth::U64).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
 }

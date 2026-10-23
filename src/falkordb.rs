@@ -34,7 +34,32 @@ struct FalkorDbBackend {
     client: Client,
     durability: Durability,
 }
-struct FalkorDbConnection(RedisConnection);
+struct FalkorDbConnection {
+    connection: RedisConnection,
+    /// The `CYPHER ...` request, rebuilt in place for every query.
+    wire: Vec<u8, System>,
+}
+
+impl FalkorDbConnection {
+    fn new(connection: RedisConnection) -> Self {
+        Self {
+            connection,
+            wire: Vec::new_in(System),
+        }
+    }
+}
+
+/// Writes `name=value ` into the request when the query names `$name`.
+fn write_parameter(wire: &mut Vec<u8, System>, query: &str, name: &str, value: &impl serde::Serialize) -> Result<()> {
+    if !query.split('$').skip(1).any(|rest| rest.starts_with(name)) {
+        return Ok(());
+    }
+    wire.extend_from_slice(name.as_bytes());
+    wire.push(b'=');
+    serde_json::to_writer(&mut *wire, value).map_err(|e| e.to_string())?;
+    wire.push(b' ');
+    Ok(())
+}
 fn scalar_i64(value: &RedisValue) -> Result<Option<i64>> {
     match value {
         RedisValue::Nil => Ok(None),
@@ -53,20 +78,12 @@ fn scalar_key(value: &RedisValue) -> Result<Option<Key>> {
 }
 impl CypherConnection for FalkorDbConnection {
     fn execute(&mut self, query: &str, params: &Parameters, output: &mut CypherOutput<'_, '_, '_>) -> Result<usize> {
-        let mut wire = Vec::new_in(System);
+        let wire = &mut self.wire;
+        wire.clear();
         wire.extend_from_slice(b"CYPHER ");
-        macro_rules! parameter {
-            ($name:literal,$value:expr) => {
-                if query.contains(concat!("$", $name)) {
-                    wire.extend_from_slice(concat!($name, "=").as_bytes());
-                    serde_json::to_writer(&mut wire, $value).map_err(|e| e.to_string())?;
-                    wire.push(b' ');
-                }
-            };
-        }
-        parameter!("keys", params.keys.as_slice());
-        parameter!("start", &params.start);
-        parameter!("limit", &params.limit);
+        write_parameter(wire, query, "keys", &params.keys.as_slice())?;
+        write_parameter(wire, query, "start", &params.start)?;
+        write_parameter(wire, query, "limit", &params.limit)?;
         if query.contains("$vertices") {
             wire.extend_from_slice(b"vertices=[");
             for (i, row) in params.vertices.iter().enumerate() {
@@ -103,7 +120,7 @@ impl CypherConnection for FalkorDbConnection {
         let response: RedisValue = redis::cmd("GRAPH.QUERY")
             .arg("crudeval")
             .arg(wire.as_slice())
-            .query(&mut self.0)
+            .query(&mut self.connection)
             .map_err(|e| e.to_string())?;
         output.clear();
         let RedisValue::Array(parts) = response else {
@@ -170,7 +187,7 @@ fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
     )?;
     let client = Client::open(format!("redis://127.0.0.1:{}/", container.port)).map_err(|e| e.to_string())?;
     container.ready(|| {
-        let mut c = FalkorDbConnection(client.get_connection().map_err(|e| e.to_string())?);
+        let mut c = FalkorDbConnection::new(client.get_connection().map_err(|e| e.to_string())?);
         c.execute(
             "RETURN 1 AS count",
             &Parameters::default(),
@@ -178,7 +195,7 @@ fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
         )
         .map(|_| ())
     })?;
-    let mut connection = FalkorDbConnection(client.get_connection().map_err(|e| e.to_string())?);
+    let mut connection = FalkorDbConnection::new(client.get_connection().map_err(|e| e.to_string())?);
     if let Err(error) = connection.execute(
         "CREATE INDEX FOR (v:Vertex) ON (v.id)",
         &Parameters::default(),
@@ -223,7 +240,7 @@ impl Backend for FalkorDbBackend {
     }
     fn session(&self) -> Result<Box<dyn BackendSession + '_, System>> {
         Ok(Box::new_in(
-            CypherSession::new(FalkorDbConnection(
+            CypherSession::new(FalkorDbConnection::new(
                 self.client.get_connection().map_err(|e| e.to_string())?,
             )),
             System,

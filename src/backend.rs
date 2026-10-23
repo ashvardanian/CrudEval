@@ -11,6 +11,153 @@ use serde_json::Value;
 pub type Key = uuid::Uuid;
 pub type Result<T> = std::result::Result<T, String>;
 
+/// How record ordinals become keys, and how wide engines store them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyType {
+    U32,
+    U64,
+    /// Random UUIDs, scattered over the whole key space.
+    #[value(name = "uuid-v4")]
+    #[serde(rename = "uuid-v4")]
+    UuidV4,
+    /// Time-ordered UUIDs: the ordinal is the timestamp and counter, so keys sort as ordinals do.
+    #[default]
+    #[value(name = "uuid-v7")]
+    #[serde(rename = "uuid-v7")]
+    UuidV7,
+}
+
+/// The SplitMix64 finalizer, a bijection that spreads every input bit over the whole output.
+fn mix(value: u64) -> u64 {
+    let value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+/// The inverse of [`mix`], undoing each xor-shift and multiplying by each constant's modular inverse.
+fn unmix(value: u64) -> u64 {
+    let unshift = |value: u64, shift: u32| (1..=64 / shift).fold(value, |undone, _| value ^ (undone >> shift));
+    let value = unshift(value, 31).wrapping_mul(0x3196_42B2_D24D_8EC3);
+    let value = unshift(value, 27).wrapping_mul(0x96DE_1B17_3F11_9089);
+    unshift(value, 30)
+}
+
+/// Bits of a UUID that are neither its version nor its variant: 48, then 12, then 62.
+const UUID_FREE_LOW_BITS: u32 = 58;
+
+/// An RFC 9562 UUID of `version` that keeps all 64 `payload` bits, in order, around the version and
+/// variant fields, so distinct payloads never collide; `filler` supplies the remaining 58 bits.
+fn uuid(version: u128, payload: u64, filler: u64) -> Key {
+    let (payload, filler) = (u128::from(payload), u128::from(filler));
+    Key::from_u128(
+        (payload >> 16) << 80
+            | version << 76
+            | (payload >> 4 & 0xFFF) << 64
+            | 0b10 << 62
+            | (payload & 0xF) << UUID_FREE_LOW_BITS
+            | filler & ((1 << UUID_FREE_LOW_BITS) - 1),
+    )
+}
+
+/// The `payload` that [`uuid`] spread around the version and variant fields.
+fn uuid_payload(key: Key) -> u64 {
+    let bits = key.as_u128();
+    ((bits >> 80) << 16 | (bits >> 64 & 0xFFF) << 4 | (bits >> UUID_FREE_LOW_BITS & 0xF)) as u64
+}
+
+impl KeyType {
+    /// The key of record `ordinal`, unique to it.
+    pub fn encode(self, ordinal: u64) -> Key {
+        match self {
+            Self::U32 | Self::U64 => Key::from_u128(u128::from(ordinal)),
+            Self::UuidV4 => uuid(4, mix(ordinal), mix(ordinal ^ 0x9E37_79B9_7F4A_7C15)),
+            Self::UuidV7 => uuid(7, ordinal, mix(ordinal)),
+        }
+    }
+
+    /// The ordinal [`encode`](Self::encode) made `key` from, or `None` for a key it never makes.
+    pub fn decode(self, key: Key) -> Option<u64> {
+        let ordinal = match self {
+            Self::U32 => u64::from(u32::try_from(key.as_u128()).ok()?),
+            Self::U64 => u64::try_from(key.as_u128()).ok()?,
+            Self::UuidV4 => unmix(uuid_payload(key)),
+            Self::UuidV7 => uuid_payload(key),
+        };
+        (self.encode(ordinal) == key).then_some(ordinal)
+    }
+
+    /// Ordinals this type can name before its keys run out.
+    pub fn capacity(self) -> u64 {
+        match self {
+            Self::U32 => 1 << 32,
+            Self::U64 | Self::UuidV4 | Self::UuidV7 => u64::MAX,
+        }
+    }
+
+    /// How wide engines store these keys.
+    pub fn width(self) -> KeyWidth {
+        match self {
+            Self::U32 => KeyWidth::U32,
+            Self::U64 => KeyWidth::U64,
+            Self::UuidV4 | Self::UuidV7 => KeyWidth::U128,
+        }
+    }
+}
+
+/// How wide engines store a run's keys: the key type's width, or the key file's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyWidth {
+    U32,
+    U64,
+    U128,
+}
+
+impl KeyWidth {
+    /// The width a key file's extension names: `.i32bin`, `.u64bin` or `.uuidbin`.
+    pub fn of_file(path: &std::path::Path) -> Result<Self> {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("i32bin") => Ok(Self::U32),
+            Some("u64bin") => Ok(Self::U64),
+            Some("uuidbin") => Ok(Self::U128),
+            _ => Err(format!("{}: keys are .i32bin, .u64bin or .uuidbin", path.display())),
+        }
+    }
+
+    /// Bytes per stored key: 4, 8 or 16.
+    pub fn size(self) -> usize {
+        match self {
+            Self::U32 => 4,
+            Self::U64 => 8,
+            Self::U128 => 16,
+        }
+    }
+
+    /// The key's big-endian bytes at this width, so byte order sorts as keys do.
+    pub fn bytes(self, key: &Key) -> &[u8] {
+        &key.as_bytes()[16 - self.size()..]
+    }
+
+    /// The key that [`bytes`](Self::bytes) stored as `bytes`.
+    pub fn from_bytes(self, bytes: &[u8]) -> Result<Key> {
+        if bytes.len() != self.size() {
+            return Err(format!("a {}-byte key is not a {self:?} key", bytes.len()));
+        }
+        let mut padded = [0; 16];
+        padded[16 - bytes.len()..].copy_from_slice(bytes);
+        Ok(Key::from_bytes(padded))
+    }
+
+    /// A key as a key file stores it: integers little-endian, UUIDs most significant byte first.
+    pub fn read(self, bytes: &[u8]) -> Key {
+        match self {
+            Self::U32 => Key::from_u128(u128::from(u32::from_le_bytes(bytes.try_into().unwrap()))),
+            Self::U64 => Key::from_u128(u128::from(u64::from_le_bytes(bytes.try_into().unwrap()))),
+            Self::U128 => Key::from_bytes(bytes.try_into().unwrap()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DataModel {
@@ -779,6 +926,41 @@ pub(crate) mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn key_types_round_trip_keep_order_where_promised_and_store_narrow() {
+        let ordinals = [
+            0,
+            1,
+            2,
+            15,
+            16,
+            4095,
+            4096,
+            65_535,
+            65_536,
+            u64::from(u32::MAX),
+            6_039_411_649,
+        ];
+        for key_type in [KeyType::U32, KeyType::U64, KeyType::UuidV4, KeyType::UuidV7] {
+            let ordinals = ordinals.iter().filter(|&&ordinal| ordinal < key_type.capacity());
+            let keys: Vec<Key> = ordinals.clone().map(|&ordinal| key_type.encode(ordinal)).collect();
+            for (&ordinal, key) in ordinals.zip(&keys) {
+                assert_eq!(key_type.decode(*key), Some(ordinal), "{key_type:?}");
+                let stored = key_type.width().bytes(key);
+                assert_eq!(stored.len(), key_type.width().size());
+                assert_eq!(key_type.width().from_bytes(stored), Ok(*key));
+            }
+            let ascending = keys.windows(2).all(|pair| pair[0] < pair[1]);
+            let stored_ascending = keys
+                .windows(2)
+                .all(|pair| key_type.width().bytes(&pair[0]) < key_type.width().bytes(&pair[1]));
+            assert_eq!(ascending, key_type != KeyType::UuidV4, "{key_type:?}");
+            assert_eq!(stored_ascending, ascending, "{key_type:?}");
+        }
+        assert_eq!(KeyType::U32.decode(Key::from_u128(1 << 32)), None);
+        assert_eq!(KeyType::UuidV7.decode(Key::from_u128(7)), None);
+    }
 
     struct TrackingAllocator;
     thread_local! {

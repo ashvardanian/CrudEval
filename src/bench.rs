@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 pub use crate::backend::{
-    Backend, BackendCapabilities, BackendSession, DataModel, Durability, Key, RecordBatch, Result,
+    Backend, BackendCapabilities, BackendSession, DataModel, Durability, Key, KeyType, KeyWidth, RecordBatch, Result,
 };
 
 /// Version of the report layout, bumped when a field changes meaning.
@@ -22,7 +22,7 @@ const REPORT_SCHEMA_VERSION: u32 = 2;
 /// Version of the adapters' observable behaviour, recorded in each report.
 const ADAPTER_REVISION: u32 = 2;
 /// Version of the data-directory identity, bumped when its inputs change.
-const IDENTITY_VERSION: u32 = 2;
+const IDENTITY_VERSION: u32 = 3;
 /// Version of the `.crudeval` manifest layout.
 const MANIFEST_FORMAT: u32 = 1;
 
@@ -80,60 +80,76 @@ impl serde::Serialize for EntryBudget {
 #[derive(Args, Clone, Debug, serde::Serialize)]
 pub struct CommonArgs {
     /// Initial record counts; comma-separated values form a sweep.
-    #[arg(long, value_delimiter = ',', default_value = "100K", value_parser = workload::parse_count)]
+    #[arg(long, env = "CRUDEVAL_RECORDS", value_delimiter = ',', default_value = "100K", value_parser = workload::parse_count)]
     pub records: Vec<u64>,
     /// Worker counts, 0 for all cores; comma-separated values form a sweep.
-    #[arg(long, value_delimiter = ',', default_value = "1", value_parser = parse_threads_flag)]
+    #[arg(long, env = "CRUDEVAL_THREADS", value_delimiter = ',', default_value = "1", value_parser = parse_threads_flag)]
     pub threads: Vec<Threads>,
     /// Ordered comma-separated workload names.
-    #[arg(long, value_delimiter = ',', default_value = workload::DEFAULT_WORKLOADS, value_parser = |text: &str| text.parse::<Workload>())]
+    #[arg(long, env = "CRUDEVAL_WORKLOADS", value_delimiter = ',', default_value = workload::DEFAULT_WORKLOADS, value_parser = |text: &str| text.parse::<Workload>())]
     pub workloads: Vec<Workload>,
     /// Override key sampling for the selected workloads.
-    #[arg(long, value_enum)]
+    #[arg(long, env = "CRUDEVAL_DISTRIBUTION", value_enum)]
     pub distribution: Option<data::Distribution>,
     /// Attempted entries per ordinary workload, as a count or percentage.
-    #[arg(long, default_value = "10%", value_parser = parse_entries_flag)]
+    #[arg(long, env = "CRUDEVAL_ENTRIES", default_value = "10%", value_parser = parse_entries_flag)]
     pub entries: EntryBudget,
     /// Time limit instead of an entry budget, such as 30s or 500ms.
-    #[arg(long, value_parser = parse_duration_flag)]
+    #[arg(long, env = "CRUDEVAL_TIME_LIMIT", value_parser = parse_duration_flag)]
     pub time_limit: Option<Duration>,
     /// Binary payload size or range, such as 1KB or 100..1KB.
-    #[arg(long, default_value = "1KB", value_parser = workload::parse_value_size)]
+    #[arg(long, env = "CRUDEVAL_VALUE_SIZE", default_value = "1KB", value_parser = workload::parse_value_size)]
     #[serde(serialize_with = "serialize_value_size")]
     pub value_size: RangeInclusive<Bytes>,
     /// Parent directory for isolated, marked benchmark databases.
-    #[arg(long, default_value = "data")]
+    #[arg(long, env = "CRUDEVAL_DATA_DIR", default_value = "data")]
     pub data_dir: PathBuf,
     /// Directory for JSON reports.
-    #[arg(long, default_value = "results")]
+    #[arg(long, env = "CRUDEVAL_OUTPUT", default_value = "results")]
     pub output: PathBuf,
     /// Seed for data and per-worker random generators, or `random` to draw one.
-    #[arg(long, default_value = "42", value_parser = parse_seed_flag)]
+    #[arg(long, env = "CRUDEVAL_SEED", default_value = "42", value_parser = parse_seed_flag)]
     pub seed: Seed,
     /// Requested write durability; adapters report their effective settings.
-    #[arg(long, value_enum, default_value = "none")]
+    #[arg(long, env = "CRUDEVAL_DURABILITY", value_enum, default_value = "none")]
     pub durability: Durability,
     /// Storage model to exercise.
-    #[arg(long, value_enum, default_value = "key-value")]
+    #[arg(long, env = "CRUDEVAL_DATA_MODEL", value_enum, default_value = "key-value")]
     pub data_model: DataModel,
+    /// Keys records get from their ordinals: u32, u64, uuid-v4 or uuid-v7.
+    #[arg(long, env = "CRUDEVAL_KEY_TYPE", value_enum, default_value = "uuid-v7")]
+    pub key_type: KeyType,
+    /// Ascending, unique keys that ordinals index into: `.i32bin`, `.u64bin` or `.uuidbin` shards.
+    #[arg(long, env = "CRUDEVAL_KEYS", value_name = "PATH|GLOB", conflicts_with = "key_type")]
+    pub keys: Option<PathBuf>,
     /// Outgoing graph degree, capped at the initial population minus one.
-    #[arg(long, default_value = "8", value_parser = parse_count_flag)]
+    #[arg(long, env = "CRUDEVAL_DEGREE", default_value = "8", value_parser = parse_count_flag)]
     pub degree: usize,
     /// Calls per transaction; unset leaves transaction boundaries to the adapter.
-    #[arg(long, value_parser = parse_count_flag)]
+    #[arg(long, env = "CRUDEVAL_CALLS_PER_TRANSACTION", value_parser = parse_count_flag)]
     pub calls_per_transaction: Option<usize>,
     /// Aggregate scheduled calls per second across workers.
-    #[arg(long, value_parser = parse_rate_flag)]
+    #[arg(long, env = "CRUDEVAL_CALLS_PER_SECOND", value_parser = parse_rate_flag)]
     pub calls_per_second: Option<f64>,
     /// Check payload values and structure, or structure only.
-    #[arg(long, value_enum, default_value = "values")]
+    #[arg(long, env = "CRUDEVAL_VERIFY", value_enum, default_value = "values")]
     pub verify: Verify,
     /// Record Linux worker hardware counters; requires the perf-counters feature.
-    #[arg(long)]
+    #[arg(long, env = "CRUDEVAL_PERF_COUNTERS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
     pub perf_counters: bool,
     /// Keep an embedded database open between workloads, reopen it, or also drop the page cache.
-    #[arg(long, value_enum, default_value = "keep")]
+    #[arg(long, env = "CRUDEVAL_BETWEEN_WORKLOADS", value_enum, default_value = "keep")]
     pub between_workloads: BetweenWorkloads,
+}
+
+impl CommonArgs {
+    /// How wide engines store this run's keys: the key file's width, or the key type's.
+    pub fn key_width(&self) -> Result<KeyWidth> {
+        match &self.keys {
+            Some(path) => KeyWidth::of_file(path),
+            None => Ok(self.key_type.width()),
+        }
+    }
 }
 
 /// Runs every configuration; `backend_settings` are echoed after the common settings as "- Name: value".
@@ -515,6 +531,7 @@ fn run_benchmarks(
     for (name, value) in backend_settings {
         eprintln!("- {name}: {value}");
     }
+    let keys = data::Keys::new(args.keys.as_deref(), args.key_type)?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let engine = executable.file_stem().and_then(|s| s.to_str()).unwrap_or("crudeval");
     for &records in &args.records {
@@ -528,6 +545,9 @@ fn run_benchmarks(
                 records,
                 threads.0.get(),
                 args.data_model,
+                args.key_type,
+                args.keys.as_deref(),
+                keys.capacity(),
                 args.durability,
                 args.seed,
                 (*sizes.start(), *sizes.end()),
@@ -597,8 +617,14 @@ fn run_benchmarks(
                 );
             }
             let keyspace = KeySpace::restore(manifest.floor..manifest.next)?;
-            let model =
-                model::RecordGenerator::new(args.data_model, args.seed.into(), sizes.clone(), records, args.degree)?;
+            let model = model::RecordGenerator::new(
+                args.data_model,
+                &keys,
+                args.seed.into(),
+                sizes.clone(),
+                records,
+                args.degree,
+            )?;
             eprintln!(
                 "{} · {records} records · {threads} threads · {:?}",
                 engine, args.data_model
@@ -620,7 +646,12 @@ fn run_benchmarks(
                     .operations
                     .iter()
                     .any(|(op, _)| matches!(op, Operation::RangeRead | Operation::FullScan));
-                let skipped = needs_range && !backend.capabilities().ordered_ranges;
+                // A full scan splits ordinals among workers and walks each slice in key order, which
+                // random UUIDs do not follow.
+                let scans_ordinals = workload.operations.iter().any(|(op, _)| *op == Operation::FullScan)
+                    && config.key_type == KeyType::UuidV4
+                    && config.keys.is_none();
+                let skipped = needs_range && !backend.capabilities().ordered_ranges || scans_ordinals;
                 let mutating = !skipped
                     && workload.operations.iter().any(|(operation, _)| {
                         matches!(
@@ -1310,11 +1341,18 @@ fn run_worker(
             buffers.keys.clear();
             if matches!(operation, Operation::Insert | Operation::BulkLoad) {
                 let range = keyspace.reserve(thread, count)?;
-                buffers.keys.extend(range.map(|key| Key::from_u128(u128::from(key))));
-            } else if operation == Operation::Delete {
+                if range.end > generator.keys().capacity() {
+                    return Err(format!("keys end at ordinal {}", generator.keys().capacity()));
+                }
                 buffers
                     .keys
-                    .extend(keyspace.delete_oldest(count).map(|key| Key::from_u128(u128::from(key))));
+                    .extend(range.map(|ordinal| generator.keys().encode(ordinal)));
+            } else if operation == Operation::Delete {
+                buffers.keys.extend(
+                    keyspace
+                        .delete_oldest(count)
+                        .map(|ordinal| generator.keys().encode(ordinal)),
+                );
                 count = buffers.keys.len() as u64;
                 if count == 0 {
                     break;
@@ -1324,7 +1362,7 @@ fn run_worker(
                     break;
                 }
                 count = count.min(scan_end - scan_start);
-                buffers.keys.push(Key::from_u128(u128::from(scan_start)));
+                buffers.keys.push(generator.keys().encode(scan_start));
             } else {
                 let live_count = snapshot.end - snapshot.start;
                 if live_count == 0 {
@@ -1335,38 +1373,38 @@ fn run_worker(
                 }
                 let distinct = if operation == Operation::Read { count } else { 1 };
                 if distinct == 1 {
-                    buffers.keys.push(Key::from_u128(u128::from(
-                        rng.sample(workload.distribution, snapshot.clone()).unwrap(),
-                    )));
+                    buffers.keys.push(
+                        generator
+                            .keys()
+                            .encode(rng.sample(workload.distribution, snapshot.clone()).unwrap()),
+                    );
                 } else if distinct == live_count {
                     buffers
                         .keys
-                        .extend(snapshot.clone().map(|key| Key::from_u128(u128::from(key))));
+                        .extend(snapshot.clone().map(|ordinal| generator.keys().encode(ordinal)));
                     for index in (1..buffers.keys.len()).rev() {
                         buffers.keys.swap(index, rng.below(index as u64 + 1) as usize);
                     }
                 } else {
                     buffers.selected.fill(u64::MAX);
+                    let wrap = |ordinal: u64| {
+                        if ordinal + 1 == snapshot.end {
+                            snapshot.start
+                        } else {
+                            ordinal + 1
+                        }
+                    };
                     while buffers.keys.len() < distinct as usize {
-                        let mut key = rng.sample(workload.distribution, snapshot.clone()).unwrap();
-                        let mut accepted = false;
-                        for _ in 0..16 {
-                            if buffers.select(key) {
-                                accepted = true;
-                                break;
-                            }
-                            key = rng.sample(workload.distribution, snapshot.clone()).unwrap();
-                        }
-                        if !accepted {
-                            while !buffers.select(key) {
-                                key = if key + 1 == snapshot.end {
-                                    snapshot.start
-                                } else {
-                                    key + 1
-                                };
-                            }
-                        }
-                        buffers.keys.push(Key::from_u128(u128::from(key)));
+                        let mut samples =
+                            std::iter::repeat_with(|| rng.sample(workload.distribution, snapshot.clone()).unwrap());
+                        // Past 16 rejected draws, one more draw starts a walk to the next unselected ordinal.
+                        let ordinal = match samples.by_ref().take(16).find(|&ordinal| buffers.select(ordinal)) {
+                            Some(ordinal) => ordinal,
+                            None => std::iter::successors(samples.next(), |&ordinal| Some(wrap(ordinal)))
+                                .find(|&ordinal| buffers.select(ordinal))
+                                .expect("fewer distinct ordinals requested than are live"),
+                        };
+                        buffers.keys.push(generator.keys().encode(ordinal));
                     }
                 }
             }
@@ -1394,16 +1432,13 @@ fn run_worker(
                         let result = buffers.records.read(&mut session, &buffers.keys);
                         storage_time += before.elapsed();
                         let found = result?;
-                        if let Err(error) = buffers.records.verify(
+                        buffers.measurements.count_corruption(buffers.records.verify(
                             generator,
                             &buffers.keys,
                             found,
                             snapshot.start,
                             args.verify == Verify::Values,
-                        ) {
-                            buffers.measurements.corrupted += 1;
-                            return Err(error);
-                        }
+                        ))?;
                         if found != buffers.keys.len() {
                             return Ok(0);
                         }
@@ -1449,16 +1484,13 @@ fn run_worker(
                 return Err("backend did not insert the complete reserved key range".into());
             }
             if operation == Operation::Read {
-                if let Err(error) = buffers.records.verify(
+                buffers.measurements.count_corruption(buffers.records.verify(
                     generator,
                     &buffers.keys,
                     affected as usize,
                     snapshot.start,
                     args.verify == Verify::Values,
-                ) {
-                    buffers.measurements.corrupted += 1;
-                    return Err(error);
-                }
+                ))?;
             }
             if matches!(operation, Operation::RangeRead | Operation::FullScan) {
                 let keys = &buffers.scanned[..scan_count];
@@ -1478,23 +1510,22 @@ fn run_worker(
                         return Err("range keys must be unique, ascending, and at least start".into());
                     }
                     if full_scan
-                        && keys.iter().enumerate().any(|(index, key)| {
-                            key.as_u128() != u128::from(scan_start) + index as u128
-                                || key.as_u128() >= u128::from(scan_end)
+                        && keys.iter().enumerate().any(|(index, &key)| {
+                            generator
+                                .keys()
+                                .decode(key)
+                                .is_none_or(|ordinal| ordinal != scan_start + index as u64 || ordinal >= scan_end)
                         })
                     {
                         return Err("full scan crossed its shard or skipped an existing key".into());
                     }
-                    if let Err(error) = buffers.records.verify(
+                    buffers.measurements.count_corruption(buffers.records.verify(
                         generator,
                         keys,
                         affected as usize,
                         snapshot.start,
                         args.verify == Verify::Values,
-                    ) {
-                        buffers.measurements.corrupted += 1;
-                        return Err(error);
-                    }
+                    ))?;
                 }
                 if full_scan {
                     if affected != count {
@@ -1760,8 +1791,9 @@ mod tests {
     fn workloads(names: &str) -> Vec<Workload> {
         names.split(',').map(|name| name.parse().unwrap()).collect()
     }
-    fn model() -> model::RecordGenerator {
-        model::RecordGenerator::new(DataModel::KeyValue, 42, 32..=32, 7, 0).unwrap()
+    static KEYS: data::Keys = data::Keys::Generated(KeyType::U64);
+    fn model() -> model::RecordGenerator<'static> {
+        model::RecordGenerator::new(DataModel::KeyValue, &KEYS, 42, 32..=32, 7, 0).unwrap()
     }
     fn phase(
         backend: &Memory,
@@ -1856,7 +1888,8 @@ mod tests {
         args.data_dir = temp.path().join("data");
         args.output = temp.path().join("results");
         run(args.clone(), (), &[], |_, _| Ok(Box::new_in(backend.clone(), System))).unwrap();
-        assert_eq!(backend.rows.lock().unwrap().keys().next().unwrap().as_u128(), 2);
+        let first = *backend.rows.lock().unwrap().keys().next().unwrap();
+        assert_eq!(args.key_type.decode(first), Some(2));
         args.workloads = workloads("full-scan,batch-insert-1");
         run(args.clone(), (), &[], |_, _| Ok(Box::new_in(backend.clone(), System))).unwrap();
         assert_eq!(backend.rows.lock().unwrap().len(), 9);

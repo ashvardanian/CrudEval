@@ -18,8 +18,8 @@ use turso::{Connection, Database, Statement};
 use crudeval::{
     backend::{
         directory_bytes, Backend, BackendCapabilities, BackendSession, DataModel, DocumentInput, DocumentOutput,
-        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeysOutput, RecordInput, RecordOutput, Result,
-        TransactionSession,
+        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeyWidth, KeysOutput, RecordInput, RecordOutput,
+        Result, TransactionSession,
     },
     run, CommonArgs,
 };
@@ -35,6 +35,7 @@ struct TursoBackend {
     runtime: Runtime,
     path: PathBuf,
     durability: Durability,
+    key_width: KeyWidth,
     documents: bool,
 }
 
@@ -46,11 +47,12 @@ struct TursoSession<'a> {
     update: Statement,
     delete: Statement,
     range: Statement,
+    key_width: KeyWidth,
     documents: bool,
 }
 
 impl TursoBackend {
-    fn open(path: &Path, durability: Durability, documents: bool) -> Result<Self> {
+    fn open(path: &Path, durability: Durability, key_width: KeyWidth, documents: bool) -> Result<Self> {
         if durability == Durability::Buffered {
             return Err("Turso supports none (OFF) and flushed (FULL) durability, not buffered".into());
         }
@@ -75,6 +77,7 @@ impl TursoBackend {
             runtime,
             path,
             durability,
+            key_width,
             documents,
         })
     }
@@ -141,6 +144,7 @@ impl Backend for TursoBackend {
                 delete: connection.prepare("DELETE FROM records WHERE key=?1").await.map_err(|e| e.to_string())?,
                 range: connection.prepare(range).await.map_err(|e| e.to_string())?,
                 connection,
+                key_width: self.key_width,
                 documents: self.documents,
             }, System) as Box<dyn BackendSession, System>)
         })
@@ -205,7 +209,7 @@ impl BackendSession for TursoSession<'_> {
                     count += self
                         .insert
                         .execute((
-                            key.as_bytes().as_slice(),
+                            self.key_width.bytes(key),
                             values.get(index).ok_or("missing input value")?,
                         ))
                         .await
@@ -232,7 +236,7 @@ impl BackendSession for TursoSession<'_> {
                     count += self
                         .update
                         .execute((
-                            key.as_bytes().as_slice(),
+                            self.key_width.bytes(key),
                             values.get(index).ok_or("missing input value")?,
                         ))
                         .await
@@ -251,7 +255,7 @@ impl BackendSession for TursoSession<'_> {
             for key in keys {
                 let mut rows = self
                     .read
-                    .query([key.as_bytes().as_slice()])
+                    .query([self.key_width.bytes(key)])
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
@@ -280,7 +284,7 @@ impl BackendSession for TursoSession<'_> {
                 for key in keys {
                     count += self
                         .delete
-                        .execute([key.as_bytes().as_slice()])
+                        .execute([self.key_width.bytes(key)])
                         .await
                         .map_err(|e| e.to_string())? as usize;
                 }
@@ -303,7 +307,7 @@ impl BackendSession for TursoSession<'_> {
             let mut rows = self
                 .range
                 .query((
-                    start.as_bytes().as_slice(),
+                    self.key_width.bytes(&start),
                     i64::try_from(limit).map_err(|e| e.to_string())?,
                 ))
                 .await
@@ -311,7 +315,7 @@ impl BackendSession for TursoSession<'_> {
             while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
                 let key = row.get::<Vec<u8>>(0).map_err(|e| e.to_string())?;
                 let value = row.get::<Vec<u8>>(1).map_err(|e| e.to_string())?;
-                keys.push(Key::from_slice(&key).map_err(|e| e.to_string())?)?;
+                keys.push(self.key_width.from_bytes(&key)?)?;
                 output.push(Some(&value))?;
             }
             Ok(keys.len())
@@ -337,7 +341,7 @@ impl DocumentSession for TursoSession<'_> {
                     count += self
                         .insert
                         .execute((
-                            key.as_bytes().as_slice(),
+                            self.key_width.bytes(key),
                             key.hyphenated().encode_lower(&mut uuid) as &str,
                             i64::try_from(value.score).map_err(|e| e.to_string())?,
                             value.payload,
@@ -358,7 +362,7 @@ impl DocumentSession for TursoSession<'_> {
             for key in keys {
                 let mut rows = self
                     .read
-                    .query([key.as_bytes().as_slice()])
+                    .query([self.key_width.bytes(key)])
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
@@ -396,7 +400,7 @@ impl DocumentSession for TursoSession<'_> {
                     count += self
                         .update
                         .execute((
-                            key.as_bytes().as_slice(),
+                            self.key_width.bytes(key),
                             i64::try_from(patch.score).map_err(|e| e.to_string())?,
                         ))
                         .await
@@ -424,7 +428,7 @@ impl DocumentSession for TursoSession<'_> {
             let mut rows = self
                 .range
                 .query((
-                    start.as_bytes().as_slice(),
+                    self.key_width.bytes(&start),
                     i64::try_from(limit).map_err(|e| e.to_string())?,
                 ))
                 .await
@@ -433,7 +437,7 @@ impl DocumentSession for TursoSession<'_> {
                 let key = row.get::<Vec<u8>>(0).map_err(|e| e.to_string())?;
                 let score = u64::try_from(row.get::<i64>(1).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
                 let payload = row.get::<String>(2).map_err(|e| e.to_string())?;
-                keys.push(Key::from_slice(&key).map_err(|e| e.to_string())?)?;
+                keys.push(self.key_width.from_bytes(&key)?)?;
                 output.push(Some(DocumentRef {
                     score,
                     payload: &payload,
@@ -472,7 +476,12 @@ fn main() -> Result<()> {
             return Err("Turso graph workloads are unsupported".into());
         }
         Ok(Box::new_in(
-            TursoBackend::open(path, args.durability, args.data_model == DataModel::Documents)?,
+            TursoBackend::open(
+                path,
+                args.durability,
+                args.key_width()?,
+                args.data_model == DataModel::Documents,
+            )?,
             System,
         ))
     })
@@ -485,13 +494,13 @@ mod tests {
     #[test]
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
-        let db = TursoBackend::open(directory.path(), Durability::None, false).unwrap();
+        let db = TursoBackend::open(directory.path(), Durability::None, KeyWidth::U64, false).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
     #[test]
     fn jsonb_patch_is_exact_and_rollback_preserves_payload() {
         let directory = tempfile::tempdir().unwrap();
-        let db = TursoBackend::open(directory.path(), Durability::Flushed, true).unwrap();
+        let db = TursoBackend::open(directory.path(), Durability::Flushed, KeyWidth::U64, true).unwrap();
         let mut session = db.session().unwrap();
         let session = session.documents().unwrap();
         let key = Key::from_u128(256);

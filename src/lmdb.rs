@@ -21,8 +21,8 @@ use serde_json::json;
 
 use crudeval::{
     backend::{
-        directory_bytes, Backend, BackendCapabilities, BackendSession, DataModel, Durability, Key, KeysOutput,
-        RecordInput, RecordOutput, Result, TransactionSession,
+        directory_bytes, Backend, BackendCapabilities, BackendSession, DataModel, Durability, Key, KeyWidth,
+        KeysOutput, RecordInput, RecordOutput, Result, TransactionSession,
     },
     run, CommonArgs,
 };
@@ -32,18 +32,19 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
     /// Largest database the memory map can hold, like 1TB.
-    #[arg(long, default_value = "1TB", value_parser = crudeval::workload::parse_size)]
+    #[arg(long, env = "CRUDEVAL_MAP_SIZE", default_value = "1TB", value_parser = crudeval::workload::parse_size)]
     map_size: crudeval::Bytes,
 }
 struct LmdbBackend {
     env: Env,
+    key_width: KeyWidth,
     db: Database<Bytes, Bytes>,
     path: PathBuf,
     durability: Durability,
     map_size: usize,
 }
 impl LmdbBackend {
-    fn open(path: &Path, durability: Durability, map_size: usize) -> Result<Self> {
+    fn open(path: &Path, durability: Durability, key_width: KeyWidth, map_size: usize) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let mut options = EnvOpenOptions::new();
         options.map_size(map_size).max_readers(4096);
@@ -59,6 +60,7 @@ impl LmdbBackend {
         transaction.commit().map_err(|e| e.to_string())?;
         Ok(Self {
             env,
+            key_width,
             db,
             path: path.into(),
             durability,
@@ -129,8 +131,12 @@ impl BackendSession for LmdbSession<'_> {
         let db = self.backend.db;
         self.write(|tx| {
             for (i, key) in keys.iter().enumerate() {
-                db.put(tx, key.as_bytes(), values.get(i).ok_or("missing input value")?)
-                    .map_err(|e| e.to_string())?;
+                db.put(
+                    tx,
+                    self.backend.key_width.bytes(key),
+                    values.get(i).ok_or("missing input value")?,
+                )
+                .map_err(|e| e.to_string())?;
             }
             Ok(keys.len())
         })
@@ -146,7 +152,11 @@ impl BackendSession for LmdbSession<'_> {
         };
         let mut found = 0;
         for key in keys {
-            let value = self.backend.db.get(tx, key.as_bytes()).map_err(|e| e.to_string())?;
+            let value = self
+                .backend
+                .db
+                .get(tx, self.backend.key_width.bytes(key))
+                .map_err(|e| e.to_string())?;
             found += usize::from(value.is_some());
             output.push(value)?;
         }
@@ -157,9 +167,17 @@ impl BackendSession for LmdbSession<'_> {
         self.write(|tx| {
             let mut count = 0;
             for (i, key) in keys.iter().enumerate() {
-                if db.get(tx, key.as_bytes()).map_err(|e| e.to_string())?.is_some() {
-                    db.put(tx, key.as_bytes(), values.get(i).ok_or("missing input value")?)
-                        .map_err(|e| e.to_string())?;
+                if db
+                    .get(tx, self.backend.key_width.bytes(key))
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+                {
+                    db.put(
+                        tx,
+                        self.backend.key_width.bytes(key),
+                        values.get(i).ok_or("missing input value")?,
+                    )
+                    .map_err(|e| e.to_string())?;
                     count += 1;
                 }
             }
@@ -171,7 +189,10 @@ impl BackendSession for LmdbSession<'_> {
         self.write(|tx| {
             let mut count = 0;
             for key in keys {
-                count += usize::from(db.delete(tx, key.as_bytes()).map_err(|e| e.to_string())?);
+                count += usize::from(
+                    db.delete(tx, self.backend.key_width.bytes(key))
+                        .map_err(|e| e.to_string())?,
+                );
             }
             Ok(count)
         })
@@ -193,7 +214,7 @@ impl BackendSession for LmdbSession<'_> {
             &read
         };
         let range = (
-            std::ops::Bound::Included(start.as_bytes().as_slice()),
+            std::ops::Bound::Included(self.backend.key_width.bytes(&start)),
             std::ops::Bound::Unbounded,
         );
         for row in self
@@ -204,7 +225,7 @@ impl BackendSession for LmdbSession<'_> {
             .take(limit)
         {
             let (key, value) = row.map_err(|e| e.to_string())?;
-            keys.push(Key::from_slice(key).map_err(|e| e.to_string())?)?;
+            keys.push(self.backend.key_width.from_bytes(key)?)?;
             output.push(Some(value))?;
         }
         Ok(keys.len())
@@ -247,6 +268,7 @@ fn main() -> Result<()> {
                 LmdbBackend::open(
                     path,
                     args.durability,
+                    args.key_width()?,
                     usize::try_from(cli.map_size.0).map_err(|_| "map size exceeds platform limit")?,
                 )?,
                 System,
@@ -263,7 +285,7 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = LmdbBackend::open(path, Durability::None, 64 << 20).unwrap();
+        let db = LmdbBackend::open(path, Durability::None, KeyWidth::U64, 64 << 20).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
 }

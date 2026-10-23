@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 use crudeval::{
     backend::{
         Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, DocumentInput, DocumentOutput,
-        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeysOutput, RecordInput, RecordOutput, Result,
-        TransactionSession,
+        DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeyWidth, KeysOutput, RecordInput, RecordOutput,
+        Result, TransactionSession,
     },
     docker::{ContainerHandle, NetworkHandle, Startup},
     run, BetweenWorkloads, CommonArgs,
@@ -37,7 +37,7 @@ enum Server {
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
-    #[arg(long, value_enum, default_value = "mongodb")]
+    #[arg(long, env = "CRUDEVAL_SERVER", value_enum, default_value = "mongodb")]
     server: Server,
 }
 struct MongoDbBackend {
@@ -48,6 +48,7 @@ struct MongoDbBackend {
     image: &'static str,
     client: Client,
     data_model: DataModel,
+    key_width: KeyWidth,
     durability: Durability,
 }
 struct MongoDbSession {
@@ -55,11 +56,12 @@ struct MongoDbSession {
     database: Database,
     rows: Vec<(Key, Document), System>,
     data_model: DataModel,
+    key_width: KeyWidth,
 }
-fn id(key: Key) -> Bson {
+fn id(key_width: KeyWidth, key: Key) -> Bson {
     Bson::Binary(Binary {
         subtype: BinarySubtype::Generic,
-        bytes: key.as_bytes().to_vec(),
+        bytes: key_width.bytes(&key).to_vec(),
     })
 }
 fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backend, System>> {
@@ -184,6 +186,7 @@ fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backen
             image,
             client,
             data_model: args.data_model,
+            key_width: args.key_width()?,
             durability: args.durability,
         },
         System,
@@ -225,6 +228,7 @@ impl Backend for MongoDbBackend {
                 database: self.client.database("crudeval"),
                 rows: Vec::new_in(System),
                 data_model: self.data_model,
+                key_width: self.key_width,
             },
             System,
         ))
@@ -256,8 +260,8 @@ impl Backend for MongoDbBackend {
         }
     }
 }
-fn document_key(doc: &Document) -> Result<Key> {
-    Key::from_slice(doc.get_binary_generic("_id").map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+fn document_key(key_width: KeyWidth, doc: &Document) -> Result<Key> {
+    key_width.from_bytes(doc.get_binary_generic("_id").map_err(|e| e.to_string())?)
 }
 fn document_ref(doc: &Document) -> Result<DocumentRef<'_>> {
     Ok(DocumentRef {
@@ -268,7 +272,7 @@ fn document_ref(doc: &Document) -> Result<DocumentRef<'_>> {
 impl MongoDbSession {
     fn fetch(&mut self, keys: &[Key]) -> Result<()> {
         self.rows.clear();
-        let ids: Vec<_> = keys.iter().map(|key| id(*key)).collect();
+        let ids: Vec<_> = keys.iter().map(|key| id(self.key_width, *key)).collect();
         let cursor = self
             .collection
             .find(doc! {"_id":{"$in":ids}})
@@ -276,7 +280,7 @@ impl MongoDbSession {
             .map_err(|e| e.to_string())?;
         for row in cursor {
             let row = row.map_err(|e| e.to_string())?;
-            self.rows.push((document_key(&row)?, row));
+            self.rows.push((document_key(self.key_width, &row)?, row));
         }
         self.rows.sort_unstable_by_key(|row| row.0);
         Ok(())
@@ -315,7 +319,7 @@ impl BackendSession for MongoDbSession {
         if keys.is_empty() {
             return Ok(0);
         }
-        let docs=keys.iter().enumerate().map(|(i,key)|Ok(doc! {"_id":id(*key),"value":Binary {subtype:BinarySubtype::Generic,bytes:values.get(i).ok_or("Missing value")?.to_vec()}})).collect::<Result<Vec<_>>>()?;
+        let docs=keys.iter().enumerate().map(|(i,key)|Ok(doc! {"_id":id(self.key_width, *key),"value":Binary {subtype:BinarySubtype::Generic,bytes:values.get(i).ok_or("Missing value")?.to_vec()}})).collect::<Result<Vec<_>>>()?;
         self.collection
             .insert_many(docs)
             .run()
@@ -341,11 +345,11 @@ impl BackendSession for MongoDbSession {
         Ok(found)
     }
     fn update(&mut self, keys: &[Key], values: &RecordInput<'_>) -> Result<usize> {
-        let updates=keys.iter().enumerate().map(|(i,key)|Ok(doc! {"q":{"_id":id(*key)},"u":{"$set":{"value":Binary {subtype:BinarySubtype::Generic,bytes:values.get(i).ok_or("Missing value")?.to_vec()}}},"upsert":false})).collect::<Result<Vec<_>>>()?;
+        let updates=keys.iter().enumerate().map(|(i,key)|Ok(doc! {"q":{"_id":id(self.key_width, *key)},"u":{"$set":{"value":Binary {subtype:BinarySubtype::Generic,bytes:values.get(i).ok_or("Missing value")?.to_vec()}}},"upsert":false})).collect::<Result<Vec<_>>>()?;
         self.write_updates(updates)
     }
     fn delete(&mut self, keys: &[Key]) -> Result<usize> {
-        let ids: Vec<_> = keys.iter().map(|key| id(*key)).collect();
+        let ids: Vec<_> = keys.iter().map(|key| id(self.key_width, *key)).collect();
         self.collection
             .delete_many(doc! {"_id":{"$in":ids}})
             .run()
@@ -366,14 +370,14 @@ impl BackendSession for MongoDbSession {
         }
         let cursor = self
             .collection
-            .find(doc! {"_id":{"$gte":id(start)}})
+            .find(doc! {"_id":{"$gte":id(self.key_width, start)}})
             .sort(doc! {"_id":1})
             .limit(limit as i64)
             .run()
             .map_err(|e| e.to_string())?;
         for doc in cursor {
             let doc = doc.map_err(|e| e.to_string())?;
-            keys.push(document_key(&doc)?)?;
+            keys.push(document_key(self.key_width, &doc)?)?;
             out.push(Some(doc.get_binary_generic("value").map_err(|e| e.to_string())?))?;
         }
         Ok(keys.len())
@@ -389,7 +393,7 @@ impl DocumentSession for MongoDbSession {
             .enumerate()
             .map(|(i, key)| {
                 let value = values.get(i).ok_or("Missing document")?;
-                Ok(doc! {"_id":id(*key),"score":value.score as i64,"payload":value.payload})
+                Ok(doc! {"_id":id(self.key_width, *key),"score":value.score as i64,"payload":value.payload})
             })
             .collect::<Result<Vec<_>>>()?;
         self.collection
@@ -413,7 +417,7 @@ impl DocumentSession for MongoDbSession {
         let updates = keys
             .iter()
             .zip(patches)
-            .map(|(key, patch)| doc! {"q":{"_id":id(*key)},"u":{"$set":{"score":patch.score as i64}},"upsert":false})
+            .map(|(key, patch)| doc! {"q":{"_id":id(self.key_width, *key)},"u":{"$set":{"score":patch.score as i64}},"upsert":false})
             .collect();
         self.write_updates(updates)
     }
@@ -434,14 +438,14 @@ impl DocumentSession for MongoDbSession {
         }
         let cursor = self
             .collection
-            .find(doc! {"_id":{"$gte":id(start)}})
+            .find(doc! {"_id":{"$gte":id(self.key_width, start)}})
             .sort(doc! {"_id":1})
             .limit(limit as i64)
             .run()
             .map_err(|e| e.to_string())?;
         for doc in cursor {
             let doc = doc.map_err(|e| e.to_string())?;
-            keys.push(document_key(&doc)?)?;
+            keys.push(document_key(self.key_width, &doc)?)?;
             out.push(Some(document_ref(&doc)?))?;
         }
         Ok(keys.len())

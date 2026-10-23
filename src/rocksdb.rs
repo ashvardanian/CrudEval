@@ -22,7 +22,7 @@ use serde_json::json;
 
 use crudeval::{
     backend::{
-        directory_bytes, Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, Durability, Key,
+        directory_bytes, Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, Durability, Key, KeyWidth,
         KeysOutput, RecordInput, RecordOutput, Result, TransactionSession,
     },
     run, Bytes, CommonArgs,
@@ -33,11 +33,12 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
     /// Memtable size before a flush, like 128MB.
-    #[arg(long, default_value = "128MB", value_parser = crudeval::workload::parse_size)]
+    #[arg(long, env = "CRUDEVAL_WRITE_BUFFER_SIZE", default_value = "128MB", value_parser = crudeval::workload::parse_size)]
     write_buffer_size: Bytes,
 }
 struct RocksDbBackend {
     db: DB,
+    key_width: KeyWidth,
     path: PathBuf,
     durability: Durability,
     write_buffer_size: usize,
@@ -46,7 +47,7 @@ struct RocksDbBackend {
     ingested: AtomicBool,
 }
 impl RocksDbBackend {
-    fn open(path: &Path, durability: Durability, write_buffer_size: usize) -> Result<Self> {
+    fn open(path: &Path, durability: Durability, key_width: KeyWidth, write_buffer_size: usize) -> Result<Self> {
         if write_buffer_size == 0 {
             return Err("write buffer size must be positive".into());
         }
@@ -59,6 +60,7 @@ impl RocksDbBackend {
         write_options.set_sync(durability == Durability::Flushed);
         Ok(Self {
             db,
+            key_width,
             write_options,
             path: path.into(),
             durability,
@@ -117,7 +119,7 @@ impl BackendSession for RocksDbSession<'_> {
             self.0
                 .db
                 .put_opt(
-                    key.as_bytes(),
+                    self.0.key_width.bytes(key),
                     values.get(0).ok_or("missing input value")?,
                     &self.0.write_options,
                 )
@@ -126,7 +128,7 @@ impl BackendSession for RocksDbSession<'_> {
         }
         let mut batch = WriteBatch::default();
         for (i, key) in keys.iter().enumerate() {
-            batch.put(key.as_bytes(), values.get(i).ok_or("missing input value")?);
+            batch.put(self.0.key_width.bytes(key), values.get(i).ok_or("missing input value")?);
         }
         self.0
             .db
@@ -137,12 +139,16 @@ impl BackendSession for RocksDbSession<'_> {
     fn read(&mut self, keys: &[Key], output: &mut RecordOutput<'_>) -> Result<usize> {
         output.clear();
         if let [key] = keys {
-            let value = self.0.db.get_pinned(key.as_bytes()).map_err(|e| e.to_string())?;
+            let value = self
+                .0
+                .db
+                .get_pinned(self.0.key_width.bytes(key))
+                .map_err(|e| e.to_string())?;
             output.push(value.as_deref())?;
             return Ok(usize::from(value.is_some()));
         }
         let mut count = 0;
-        for value in self.0.db.multi_get(keys.iter().map(Key::as_bytes)) {
+        for value in self.0.db.multi_get(keys.iter().map(|key| self.0.key_width.bytes(key))) {
             let value = value.map_err(|e| e.to_string())?;
             count += usize::from(value.is_some());
             output.push(value.as_deref())?;
@@ -154,7 +160,7 @@ impl BackendSession for RocksDbSession<'_> {
             if self
                 .0
                 .db
-                .get_pinned(key.as_bytes())
+                .get_pinned(self.0.key_width.bytes(key))
                 .map_err(|e| e.to_string())?
                 .is_none()
             {
@@ -163,7 +169,7 @@ impl BackendSession for RocksDbSession<'_> {
             self.0
                 .db
                 .put_opt(
-                    key.as_bytes(),
+                    self.0.key_width.bytes(key),
                     values.get(0).ok_or("missing input value")?,
                     &self.0.write_options,
                 )
@@ -176,11 +182,11 @@ impl BackendSession for RocksDbSession<'_> {
             if self
                 .0
                 .db
-                .get_pinned(key.as_bytes())
+                .get_pinned(self.0.key_width.bytes(key))
                 .map_err(|e| e.to_string())?
                 .is_some()
             {
-                batch.put(key.as_bytes(), values.get(i).ok_or("missing input value")?);
+                batch.put(self.0.key_width.bytes(key), values.get(i).ok_or("missing input value")?);
                 count += 1;
             }
         }
@@ -195,7 +201,7 @@ impl BackendSession for RocksDbSession<'_> {
             if self
                 .0
                 .db
-                .get_pinned(key.as_bytes())
+                .get_pinned(self.0.key_width.bytes(key))
                 .map_err(|e| e.to_string())?
                 .is_none()
             {
@@ -203,7 +209,7 @@ impl BackendSession for RocksDbSession<'_> {
             }
             self.0
                 .db
-                .delete_opt(key.as_bytes(), &self.0.write_options)
+                .delete_opt(self.0.key_width.bytes(key), &self.0.write_options)
                 .map_err(|e| e.to_string())?;
             return Ok(1);
         }
@@ -213,11 +219,11 @@ impl BackendSession for RocksDbSession<'_> {
             if self
                 .0
                 .db
-                .get_pinned(key.as_bytes())
+                .get_pinned(self.0.key_width.bytes(key))
                 .map_err(|e| e.to_string())?
                 .is_some()
             {
-                batch.delete(key.as_bytes());
+                batch.delete(self.0.key_width.bytes(key));
                 count += 1;
             }
         }
@@ -237,10 +243,10 @@ impl BackendSession for RocksDbSession<'_> {
         keys.clear();
         output.clear();
         let mut cursor = self.0.db.raw_iterator();
-        cursor.seek(start.as_bytes());
+        cursor.seek(self.0.key_width.bytes(&start));
         while keys.len() < limit {
             let Some((key, value)) = cursor.item() else { break };
-            keys.push(Key::from_slice(key).map_err(|e| e.to_string())?)?;
+            keys.push(self.0.key_width.from_bytes(key)?)?;
             output.push(Some(value))?;
             cursor.next();
         }
@@ -259,7 +265,7 @@ impl BackendSession for RocksDbSession<'_> {
         let result = (|| {
             for (i, key) in keys.iter().enumerate() {
                 writer
-                    .put(key.as_bytes(), values.get(i).ok_or("missing input value")?)
+                    .put(self.0.key_width.bytes(key), values.get(i).ok_or("missing input value")?)
                     .map_err(|e| e.to_string())?;
             }
             writer.finish().map_err(|e| e.to_string())?;
@@ -292,6 +298,7 @@ fn main() -> Result<()> {
                 RocksDbBackend::open(
                     path,
                     args.durability,
+                    args.key_width()?,
                     usize::try_from(cli.write_buffer_size.0).map_err(|_| "write buffer size exceeds platform limit")?,
                 )?,
                 System,
@@ -308,7 +315,7 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = RocksDbBackend::open(path, Durability::None, 8 << 20).unwrap();
+        let db = RocksDbBackend::open(path, Durability::None, KeyWidth::U64, 8 << 20).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
 }
