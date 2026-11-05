@@ -74,6 +74,11 @@ name = "crud-eval-scylladb"
 path = "src/scylladb.rs"
 required-features = ["scylladb-backend"]
 
+[[bin]]
+name = "crud-eval-ustore"
+path = "src/ustore.rs"
+required-features = ["ustore-backend"]
+
 [dependencies]
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -114,6 +119,9 @@ turso = { version = "=0.8.1", optional = true, default-features = false }
 ureq = { version = "3", optional = true, default-features = false, features = [
     "json",
 ] }
+ustore = { version = "1.0.0-rc.1", optional = true, default-features = false, features = [
+    "nvme",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 perf-event2 = { version = "0.7", optional = true }
@@ -128,6 +136,7 @@ lmdb-backend = ["dep:heed"]
 redb-backend = ["dep:redb"]
 fjall-backend = ["dep:fjall"]
 sqlite-backend = ["dep:rusqlite"]
+ustore-backend = ["dep:ustore"]
 turso-backend = ["dep:turso", "dep:tokio"]
 surrealdb-backend = ["tier2", "dep:ureq"]
 tier2 = []

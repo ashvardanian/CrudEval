@@ -53,6 +53,7 @@ cargo run --release --no-default-features --features neo4j-backend \
 | `crud-eval-turso`, embedded Turso 0.8.1                         |     ✓     |     ✓     |        |
 | `crud-eval-surrealdb`, SurrealDB 3.3.0                          |           |     ✓     |   ✓    |
 | `crud-eval-scylladb`, ScyllaDB 2026.3.2                         |     ✓     |     ✓     |        |
+| `crud-eval-ustore`, UStore's NVMe or RAM engine                 |     ✓     |     ✓     |   ✓    |
 
 Every binary's flags, engine-specific ones included, are listed in the [CLI Reference](#cli-reference) below.
 Reports include effective durability and distinguish native batches, protocol pipelines, and per-record loops for each operation.
@@ -70,6 +71,10 @@ Its updates and deletes read the key first, so they never create or count a miss
 Documents are typed `score bigint` and `payload text` columns, and updates set the `score` column.
 Durability `none` disables the keyspace's `durable_writes`, `buffered` uses periodic commit log sync, and `flushed` uses batch sync.
 ScyllaDB needs direct I/O on its data directory, which Docker Desktop's file sharing on macOS does not provide; run it on Linux.
+UStore opens its NVMe engine through `crudeval.ustore.json` in the run's data directory, and its RAM engine keeps its image there.
+Every UStore verb takes the whole batch on the engine's executor; updates and deletes first read which keys exist, without their values.
+UStore documents are JSON, read back as `score` and `payload` columns; graph vertices keep their versions in a blobs collection and their edges in a graph collection, identified by slot, and change in transactions.
+`--durability none` writes as `buffered`, since UStore has no log to disable.
 
 ## Workloads
 
@@ -158,6 +163,7 @@ Engines store keys as follows:
 - __ScyllaDB__ stores them in a `blob` partition key, rather than CQL's native types.
 - __Neo4j, Memgraph and FalkorDB__ store canonical 36-character UUID strings in the vertex `id` property, integers zero-padded.
 - __SurrealDB__ uses canonical UUID strings as native record identifiers.
+- __UStore__ stores every key as its 16-byte UUID, integers big-endian.
 
 Big-endian bytes and canonical strings both sort as keys do; Redis-family and ScyllaDB adapters do not expose ordered ranges.
 Documents and graph payloads also render identifiers as canonical strings where their JSON representation requires them.
@@ -270,6 +276,12 @@ crud-eval-scylladb
       Host port for CQL on localhost.
   --startup-time-limit <DURATION>       120s
       Time limit for container start and readiness.
+
+crud-eval-ustore
+  --engine <ENGINE>                     nvme
+      nvme, or ram, which keeps its image in the data directory.
+  --executor-threads <N>                0
+      Executor threads, 0 to derive them from the cores.
 ```
 
 </details>
@@ -376,13 +388,13 @@ Run `scripts/check-servers.sh` for managed server integration checks.
 ## Remaining Scope
 
 The implemented backend matrix above describes current support, not the full set of candidates considered during planning.
-UStore v1 remains deferred until its Rust dependency is public; its LevelDB engine is consequently absent too.
+UStore's RocksDB and LevelDB engines are not benchmarked through `crud-eval-ustore`.
 Native WiredTiger was deliberately excluded to avoid a separate C build and submodule; MongoDB exercises WiredTiger through a different interface and is not a substitute for a direct engine benchmark.
 Cassandra, FoundationDB, Aerospike, SplinterDB, and Haura remain later candidates, with no adapters or placeholder binaries in this crate.
 
 The following planned capabilities remain incomplete:
 
-- Grouped transactions beyond LMDB, redb, SQLite, Turso, and PostgreSQL.
+- Grouped transactions beyond LMDB, redb, SQLite, Turso, and PostgreSQL; UStore uses its own only inside graph mutations.
 - Docker reopen/cache-drop support and continuous server resource sampling; current server statistics are post-phase snapshots.
 - Document field updates beyond `/score`, incoming-neighbor graph reads, and an independent exact verifier for concurrent two-hop traversals.
 - Multiple storage directories; the old multi-disk configuration has no replacement yet.

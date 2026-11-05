@@ -24,7 +24,7 @@ Measurement and infrastructure are split into:
 
 Each backend has its own binary:
 
-- Embedded engines: [`rocksdb.rs`](rocksdb.rs), [`lmdb.rs`](lmdb.rs), [`redb.rs`](redb.rs), [`fjall.rs`](fjall.rs), [`sqlite.rs`](sqlite.rs), and [`turso.rs`](turso.rs).
+- Embedded engines: [`rocksdb.rs`](rocksdb.rs), [`lmdb.rs`](lmdb.rs), [`redb.rs`](redb.rs), [`fjall.rs`](fjall.rs), [`sqlite.rs`](sqlite.rs), [`turso.rs`](turso.rs), and [`ustore.rs`](ustore.rs).
 - Database servers and variants: [`redis.rs`](redis.rs), [`mongodb.rs`](mongodb.rs), [`postgres.rs`](postgres.rs), [`neo4j.rs`](neo4j.rs), [`falkordb.rs`](falkordb.rs), [`surrealdb.rs`](surrealdb.rs), and [`scylladb.rs`](scylladb.rs).
 
 ## Vocabulary & Contracts
