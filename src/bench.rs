@@ -22,7 +22,7 @@ const REPORT_SCHEMA_VERSION: u32 = 2;
 /// Version of the adapters' observable behaviour, recorded in each report.
 const ADAPTER_REVISION: u32 = 2;
 /// Version of the data-directory identity, bumped when its inputs change.
-const IDENTITY_VERSION: u32 = 3;
+const IDENTITY_VERSION: u32 = 4;
 /// Version of the `.crudeval` manifest layout.
 const MANIFEST_FORMAT: u32 = 1;
 
@@ -101,9 +101,9 @@ pub struct CommonArgs {
     #[arg(long, env = "CRUDEVAL_VALUE_SIZE", default_value = "1KB", value_parser = workload::parse_value_size)]
     #[serde(serialize_with = "serialize_value_size")]
     pub value_size: RangeInclusive<Bytes>,
-    /// Parent directory for isolated, marked benchmark databases.
-    #[arg(long, env = "CRUDEVAL_DATA_DIR", default_value = "data")]
-    pub data_dir: PathBuf,
+    /// Parent directories for isolated, marked benchmark databases, one per drive; the first holds the marker.
+    #[arg(long, env = "CRUDEVAL_DATA_DIR", value_delimiter = ',', default_value = "data")]
+    pub data_dir: Vec<PathBuf>,
     /// Directory for JSON reports.
     #[arg(long, env = "CRUDEVAL_OUTPUT", default_value = "results")]
     pub output: PathBuf,
@@ -149,6 +149,11 @@ impl CommonArgs {
             Some(path) => KeyWidth::of_file(path),
             None => Ok(self.key_type.width()),
         }
+    }
+    /// The configuration directory at `path` mirrored under every `--data-dir` after the first.
+    pub fn further_data_dirs(&self, path: &Path) -> Vec<PathBuf> {
+        let name = path.file_name().unwrap_or_default();
+        self.data_dir[1..].iter().map(|parent| parent.join(name)).collect()
     }
 }
 
@@ -511,7 +516,8 @@ fn run_benchmarks(
         None => eprintln!("- Entries: {}", args.entries),
     }
     eprintln!("- Value size: {}", spell_value_size(&args.value_size));
-    eprintln!("- Data dir: {}", args.data_dir.display());
+    let data_dirs: Vec<_> = args.data_dir.iter().map(|dir| dir.display().to_string()).collect();
+    eprintln!("- Data dir: {}", data_dirs.join(","));
     eprintln!("- Output: {}", args.output.display());
     eprintln!("- Seed: {}", args.seed);
     eprintln!("- Durability: {}", spell_value(&args.durability));
@@ -552,19 +558,26 @@ fn run_benchmarks(
                 args.seed,
                 (*sizes.start(), *sizes.end()),
                 args.degree,
+                args.data_dir.len(),
                 &backend_options,
             ))?;
-            let path = args.data_dir.join(format!("{engine}-{identity}"));
+            let path = args.data_dir[0].join(format!("{engine}-{identity}"));
+            let further = args.further_data_dirs(&path);
             let previous = if path.exists() {
                 Some(DataManifest::read(&path, &identity)?)
             } else {
                 None
             };
             let mut manifest = if loading {
-                if previous.is_some() {
-                    std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+                // Only the marker in the first directory vouches for the others.
+                for dir in std::iter::once(&path).chain(&further) {
+                    match (dir.exists(), previous.is_some()) {
+                        (true, true) => std::fs::remove_dir_all(dir).map_err(|e| e.to_string())?,
+                        (true, false) => return Err(format!("unowned benchmark directory {}", dir.display())),
+                        _ => {}
+                    }
+                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
                 }
-                std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
                 let manifest = DataManifest {
                     format: MANIFEST_FORMAT,
                     identity,
@@ -584,6 +597,9 @@ fn run_benchmarks(
             let mut backend = open(&config, &path)?;
             if args.calls_per_transaction.is_some() && !backend.capabilities().transactions {
                 return Err("this backend does not support --calls-per-transaction".into());
+            }
+            if !further.is_empty() && !backend.capabilities().multiple_data_dirs {
+                return Err("this backend keeps its files in one --data-dir".into());
             }
             let mut report = output::ConfigReport {
                 schema_version: REPORT_SCHEMA_VERSION,
@@ -608,6 +624,10 @@ fn run_benchmarks(
                 "successful entries published after commit".into(),
             );
             report.config.insert("backend_options".into(), backend_options.clone());
+            report.config.insert(
+                "data_disks".into(),
+                output::data_disks(&report.machine, std::iter::once(&path).chain(&further)),
+            );
             report.config.insert("initial_key_floor".into(), manifest.floor.into());
             report.config.insert("initial_key_end".into(), manifest.next.into());
             if args.perf_counters {
@@ -1651,6 +1671,7 @@ mod tests {
         fail_commit: bool,
         corrupt: bool,
         ranges: bool,
+        data_dirs: bool,
     }
     struct MemorySession<'a> {
         backend: &'a Memory,
@@ -1664,6 +1685,7 @@ mod tests {
             BackendCapabilities {
                 ordered_ranges: self.ranges,
                 transactions: true,
+                multiple_data_dirs: self.data_dirs,
                 ..Default::default()
             }
         }
@@ -1885,7 +1907,7 @@ mod tests {
             "--entries",
             "2",
         ]);
-        args.data_dir = temp.path().join("data");
+        args.data_dir = vec![temp.path().join("data")];
         args.output = temp.path().join("results");
         run(args.clone(), (), &[], |_, _| Ok(Box::new_in(backend.clone(), System))).unwrap();
         let first = *backend.rows.lock().unwrap().keys().next().unwrap();
@@ -1919,7 +1941,7 @@ mod tests {
             "--entries",
             "1",
         ]);
-        args.data_dir = temp.path().join("data");
+        args.data_dir = vec![temp.path().join("data")];
         args.output = temp.path().join("results");
         run(args.clone(), (), &[], |_, _| Ok(Box::new_in(backend.clone(), System))).unwrap();
         assert_eq!(backend.rows.lock().unwrap().len(), 8);
@@ -1940,5 +1962,38 @@ mod tests {
         assert!(result.elapsed_seconds >= 0.020);
         assert!(result.throughput <= 50.0);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn further_data_dirs_mirror_the_first_and_need_a_backend_that_spreads() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first, second) = (temp.path().join("first"), temp.path().join("second"));
+        let data_dirs = format!("{},{}", first.display(), second.display());
+        let mut args = args(&["--workloads", "bulk-load", "--data-dir", &data_dirs]);
+        args.output = temp.path().join("results");
+        let one = Memory::default();
+        let refused = run(args.clone(), (), &[], |_, _| Ok(Box::new_in(one.clone(), System))).unwrap_err();
+        assert!(refused.contains("one --data-dir"));
+        let opened = Mutex::new(Vec::new());
+        let open = |args: &CommonArgs, path: &Path| {
+            opened
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), args.further_data_dirs(path)));
+            let spreads = Memory {
+                data_dirs: true,
+                ..Default::default()
+            };
+            Ok(Box::new_in(spreads, System) as Box<dyn Backend, System>)
+        };
+        run(args.clone(), (), &[], open).unwrap();
+        let (path, further) = opened.lock().unwrap()[0].clone();
+        assert_eq!(further, [second.join(path.file_name().unwrap())]);
+        assert!(path.starts_with(&first) && further[0].is_dir());
+        std::fs::write(further[0].join("stale"), b"").unwrap();
+        run(args.clone(), (), &[], open).unwrap();
+        assert!(!further[0].join("stale").exists());
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(run(args, (), &[], open).unwrap_err().contains("unowned"));
     }
 }

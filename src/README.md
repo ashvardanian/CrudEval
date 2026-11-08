@@ -56,6 +56,7 @@ Read-modify-write derives the next value from the value actually read.
 `BackendCapabilities` describes implemented modalities, ordered ranges, transactions, and per-operation `BatchMode` values: native, pipelined, or per-record.
 Unsupported range workloads are reported as skipped and the remaining chain continues.
 LMDB, redb, SQLite, Turso, and PostgreSQL expose explicit transactions; the other adapters reject `--calls-per-transaction`.
+RocksDB and UStore's NVMe engine set `multiple_data_dirs` and open every directory `CommonArgs::further_data_dirs` names; the runner refuses several `--data-dir`s for the others.
 Redis-family and ScyllaDB adapters do not expose ordered ranges.
 RocksDB uses SST ingestion for bulk loading.
 SQLite, Turso, Redis-family servers, MongoDB, and ScyllaDB support key-value records and documents; PostgreSQL also supports graphs.
@@ -108,6 +109,7 @@ Focused tests beside the shared implementation cover:
 - Document payload preservation and graph adjacency, including stable edge slots after deletion.
 - Small entry budgets, disjoint full scans, read-modify-write, commit accounting, and skipped workloads.
 - Duration-limited arrival rates, persisted key ranges, backend configuration isolation, and interrupted mutation refusal.
+- Further data directories named like the first, cleared only under its marker, and refused by single-directory backends.
 
 `scripts/check-servers.sh` runs the ignored native server contracts and the supported server/modality workload chains.
 The contracts check document integer precision and missing updates, plus exact two-hop graph results, stable edge slots, and incident-edge deletion.

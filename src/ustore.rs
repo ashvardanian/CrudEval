@@ -1,6 +1,6 @@
 //! UStore benchmark for key-value records, JSON documents and graphs, on its NVMe or RAM engine.
 //!
-//! Requires a C++ compiler and CMake to build the engines. Every call runs on the engine's executor, in batches.
+//! Requires a C++ compiler and CMake to build the engines. Every call runs on its worker's executor, in batches.
 //!
 //! ## Build and run
 //!
@@ -19,8 +19,8 @@ use std::{
 use clap::Parser;
 use serde_json::json;
 use ustore::{
-    Arena, CollectionID, Column, Database, Edge, Engine, Entry, Executor, FieldEntry, IOOptions, Json, Matching,
-    Modality, Modification, NVMEOptions, RAMOptions, Role, Roles, Status, Text, View,
+    Arena, CollectionID, Column, DataDirectory, Database, Edge, Engine, Entry, Executor, FieldEntry, IOOptions, Json,
+    Modality, Modification, NVMEOptions, On, RAMOptions, Role, Roles, Status, Text,
 };
 
 use crudeval::{
@@ -32,6 +32,9 @@ use crudeval::{
     run, CommonArgs,
 };
 
+/// Deltas a transaction may buffer, the engine's ceiling; only a transaction's bytes are taken up front.
+const TRANSACTION_MAX_DELTAS: usize = 1 << 20;
+
 #[derive(Parser)]
 struct Cli {
     #[command(flatten)]
@@ -39,7 +42,7 @@ struct Cli {
     /// UStore engine: nvme, or ram, which keeps its image in the data directory.
     #[arg(long, env = "CRUDEVAL_ENGINE", default_value = "nvme", value_parser = |text: &str| text.parse::<Engine>())]
     engine: Engine,
-    /// Executor threads, 0 to derive them from the cores.
+    /// Executor threads of each worker, 0 to split the cores between the workers.
     #[arg(long, env = "CRUDEVAL_EXECUTOR_THREADS", default_value = "0")]
     executor_threads: usize,
 }
@@ -65,7 +68,7 @@ fn version_of(value: &[u8]) -> Result<u64> {
 
 /// The rows of `keys` that `collection` holds, read without their values.
 fn present<Parent>(
-    view: &View<'_, Parent>,
+    view: &On<'_, Parent>,
     collection: CollectionID,
     keys: &[ustore::Key],
     arena: &mut Arena,
@@ -75,6 +78,12 @@ fn present<Parent>(
     rows.clear();
     rows.extend((0..keys.len()).filter(|&row| presences.get(row)));
     Ok(rows.len())
+}
+
+/// Copies the `rows` of `keys` into `found`.
+fn gather_found(keys: &[ustore::Key], rows: &[usize], found: &mut Vec<ustore::Key, System>) {
+    found.clear();
+    found.extend(rows.iter().map(|&row| keys[row]));
 }
 
 /// The collection named `name`, created to hold `modality` when missing.
@@ -93,7 +102,8 @@ fn collection(database: &Database, executor: &Executor, name: &str, modality: Mo
 struct UStoreBackend {
     // Declared before the executor, so it closes before the executor drains.
     database: Database,
-    executor: Executor,
+    /// Opens the database; calls run on each worker's own, as one executor runs its calls in order.
+    _executor: Executor,
     engine: Engine,
     executor_threads: usize,
     data_model: DataModel,
@@ -102,32 +112,60 @@ struct UStoreBackend {
     /// Graph edges, identified by their slots.
     edges: CollectionID,
     path: PathBuf,
+    /// Data directories after the manifest's own, each on a drive of its own.
+    further: Vec<PathBuf>,
     durability: Durability,
     writes: ustore::Durability,
 }
 impl UStoreBackend {
+    /// The head of the database, on `executor`.
+    fn head<'a>(&'a self, executor: &'a Executor) -> On<'a> {
+        self.database.head().on(executor)
+    }
     fn open(
         path: &Path,
+        further: &[PathBuf],
         engine: Engine,
         data_model: DataModel,
         durability: Durability,
+        workers: usize,
         executor_threads: usize,
     ) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let directory = path.to_str().ok_or("data directory is not UTF-8")?;
+        let executor_threads = match executor_threads {
+            0 => {
+                let cores = std::thread::available_parallelism().map_err(|e| e.to_string())?.get();
+                (cores * 7 / 8 / workers).max(1)
+            }
+            threads => threads,
+        };
+        // Threads outside the opening executor share these channels, so every worker's thread gets one.
+        let io = IOOptions {
+            shared_io_channels: workers * executor_threads,
+            ..IOOptions::default()
+        };
         let (database, executor) = match engine {
             Engine::NVME => {
-                let executor =
-                    Executor::for_nvme(executor_threads, &IOOptions::default(), 0).map_err(|e| e.to_string())?;
+                let executor = Executor::for_nvme(1, &io, 0).map_err(|e| e.to_string())?;
                 let manifest = format!("{directory}/crudeval.ustore.json");
+                let mut data_directories = Vec::with_capacity(further.len());
+                for directory in further {
+                    data_directories.push(DataDirectory {
+                        path: directory.to_str().ok_or("data directory is not UTF-8")?,
+                        max_bytes: 0,
+                    });
+                }
                 let options = NVMEOptions {
+                    data_directories: &data_directories,
                     executor: Some(&executor),
+                    transaction_max_deltas: TRANSACTION_MAX_DELTAS,
                     ..NVMEOptions::at(&manifest)
                 };
                 (Database::open_nvme(&options).map_err(|e| e.to_string())?, executor)
             }
             Engine::RAM => {
-                let executor = Executor::for_ram(&[], executor_threads, 0).map_err(|e| e.to_string())?;
+                let executor = Executor::for_ram(&[], 1, 0).map_err(|e| e.to_string())?;
                 let options = RAMOptions {
                     executor: Some(&executor),
                     ..RAMOptions::default()
@@ -155,22 +193,20 @@ impl UStoreBackend {
         };
         Ok(Self {
             database,
-            executor,
+            _executor: executor,
             engine,
             executor_threads,
             data_model,
             records,
             edges,
             path: path.into(),
+            further: further.into(),
             durability,
             writes: match durability {
                 Durability::Flushed => ustore::Durability::Flushed,
                 Durability::None | Durability::Buffered => ustore::Durability::Buffered,
             },
         })
-    }
-    fn head(&self) -> View<'_> {
-        self.database.head().on(&self.executor)
     }
 }
 impl Backend for UStoreBackend {
@@ -181,6 +217,7 @@ impl Backend for UStoreBackend {
             ("library_version".into(), json!(ustore::version())),
             ("engine".into(), json!(self.engine.to_string())),
             ("executor_threads".into(), json!(self.executor_threads)),
+            ("data_directories".into(), json!(1 + self.further.len())),
             ("durability".into(), json!(self.durability)),
             ("write_durability".into(), json!(self.writes.to_string())),
             ("conditional_writes".into(), json!("presence_reads")),
@@ -196,6 +233,7 @@ impl Backend for UStoreBackend {
         BackendCapabilities {
             data_models: &[DataModel::KeyValue, DataModel::Documents, DataModel::Graph],
             ordered_ranges: true,
+            multiple_data_dirs: self.engine == Engine::NVME,
             batch_read: BatchMode::Native,
             batch_insert: BatchMode::Native,
             batch_update: BatchMode::Native,
@@ -205,7 +243,12 @@ impl Backend for UStoreBackend {
         }
     }
     fn session(&self) -> Result<Box<dyn BackendSession + '_, System>> {
-        let arena = || Arena::new_in(&self.executor).map_err(|e| e.to_string());
+        let executor = match self.engine {
+            Engine::NVME => Executor::for_nvme(self.executor_threads, &IOOptions::default(), 0),
+            _ => Executor::for_ram(&[], self.executor_threads, 0),
+        }
+        .map_err(|e| e.to_string())?;
+        let arena = || Arena::new_in(&executor).map_err(|e| e.to_string());
         Ok(Box::new_in(
             UStoreSession {
                 backend: self,
@@ -221,6 +264,7 @@ impl Backend for UStoreBackend {
                 edges: Vec::new_in(System),
                 stale: Vec::new_in(System),
                 adjacency: Vec::new_in(System),
+                executor,
             },
             System,
         ))
@@ -233,7 +277,10 @@ impl Backend for UStoreBackend {
         Ok(())
     }
     fn disk_bytes(&self) -> Result<u64> {
-        directory_bytes(&self.path)
+        std::iter::once(&self.path)
+            .chain(&self.further)
+            .map(|directory| directory_bytes(directory))
+            .sum()
     }
 }
 
@@ -251,6 +298,7 @@ struct UStoreSession<'a> {
     edges: Vec<Edge, System>,
     stale: Vec<Edge, System>,
     adjacency: Vec<GraphEdge, System>,
+    executor: Executor,
 }
 impl UStoreSession<'_> {
     fn stage(&mut self, keys: &[Key]) {
@@ -261,7 +309,7 @@ impl UStoreSession<'_> {
     fn present_documents(&mut self) -> Result<usize> {
         let gathered = self
             .backend
-            .head()
+            .head(&self.executor)
             .docs_gather(
                 self.backend.records,
                 self.keys.as_slice(),
@@ -269,7 +317,10 @@ impl UStoreSession<'_> {
                 &mut self.arena,
             )
             .map_err(|e| e.to_string())?;
-        let found = gathered.validities(0).ok_or("gather lost its score column")?;
+        let found = gathered
+            .validities(0)
+            .map_err(|e| e.to_string())?
+            .ok_or("gather lost its score column")?;
         self.rows.clear();
         self.rows.extend((0..self.keys.len()).filter(|&row| found.get(row)));
         Ok(self.rows.len())
@@ -291,10 +342,16 @@ impl UStoreSession<'_> {
         }
         Ok(())
     }
-    /// Copies the `rows` of the staged keys into `found`.
-    fn gather_found(&mut self) {
-        self.found.clear();
-        self.found.extend(self.rows.iter().map(|&row| self.keys[row]));
+    /// The staged keys, each with its staged version.
+    fn version_entries(&self) -> Vec<Entry<'_>, System> {
+        let mut entries = Vec::with_capacity_in(self.keys.len(), System);
+        entries.extend(
+            self.keys
+                .iter()
+                .zip(&self.versions)
+                .map(|(&key, version)| Entry::new(key, version)),
+        );
+        entries
     }
     /// Stages up to `limit` keys of the records from `start`, answering how many.
     fn stage_range(&mut self, start: Key, limit: usize) -> Result<usize> {
@@ -302,19 +359,14 @@ impl UStoreSession<'_> {
         if limit == 0 {
             return Ok(0);
         }
-        let head = self.backend.head();
+        let head = self.backend.head(&self.executor);
         let start = to_store(&start);
         let keys = match self.backend.data_model {
-            // Scans list blobs alone, so documents walk through a cursor of their own.
             DataModel::Documents => head
-                .docs_cursor(self.backend.records, start, Matching::default())
-                .and_then(|mut cursor| {
-                    let keys = cursor.next(limit, &mut self.arena)?;
-                    self.keys.extend_from_slice(keys);
-                    Ok(())
-                }),
+                .docs_scan(self.backend.records, start, limit, &mut self.arena)
+                .map(|keys| self.keys.extend_from_slice(keys)),
             DataModel::KeyValue | DataModel::Graph => head
-                .scan(self.backend.records, start, limit, Matching::default(), &mut self.arena)
+                .scan(self.backend.records, start, limit, &mut self.arena)
                 .map(|scanned| self.keys.extend_from_slice(scanned.keys)),
         };
         keys.map_err(|e| e.to_string())?;
@@ -324,7 +376,7 @@ impl UStoreSession<'_> {
         output.clear();
         let values = self
             .backend
-            .head()
+            .head(&self.executor)
             .read(self.backend.records, self.keys.as_slice(), &mut self.values_arena)
             .map_err(|e| e.to_string())?;
         let mut count = 0;
@@ -339,7 +391,7 @@ impl UStoreSession<'_> {
         output.clear();
         let gathered = self
             .backend
-            .head()
+            .head(&self.executor)
             .docs_gather(
                 self.backend.records,
                 self.keys.as_slice(),
@@ -349,7 +401,10 @@ impl UStoreSession<'_> {
             .map_err(|e| e.to_string())?;
         let scores = gathered.scalars::<u64>(0).map_err(|e| e.to_string())?;
         let payloads = gathered.strings(1).map_err(|e| e.to_string())?;
-        let found = gathered.validities(0).ok_or("gather lost its score column")?;
+        let found = gathered
+            .validities(0)
+            .map_err(|e| e.to_string())?
+            .ok_or("gather lost its score column")?;
         let mut count = 0;
         for (index, &score) in scores.iter().enumerate() {
             let document = match found.get(index) {
@@ -367,7 +422,7 @@ impl UStoreSession<'_> {
     }
     fn read_vertices(&mut self, output: &mut GraphOutput<'_>) -> Result<usize> {
         output.clear();
-        let head = self.backend.head();
+        let head = self.backend.head(&self.executor);
         let versions = head
             .read(self.backend.records, self.keys.as_slice(), &mut self.arena)
             .map_err(|e| e.to_string())?;
@@ -421,7 +476,7 @@ impl BackendSession for UStoreSession<'_> {
             ));
         }
         self.backend
-            .head()
+            .head(&self.executor)
             .write(self.backend.records, entries.as_slice(), self.backend.writes)
             .map_err(|e| e.to_string())?;
         Ok(keys.len())
@@ -432,7 +487,7 @@ impl BackendSession for UStoreSession<'_> {
     }
     fn update(&mut self, keys: &[Key], values: &RecordInput<'_>) -> Result<usize> {
         self.stage(keys);
-        let head = self.backend.head();
+        let head = self.backend.head(&self.executor);
         let count = present(&head, self.backend.records, &self.keys, &mut self.arena, &mut self.rows)?;
         let mut entries = Vec::with_capacity_in(count, System);
         for &row in &self.rows {
@@ -447,9 +502,9 @@ impl BackendSession for UStoreSession<'_> {
     }
     fn delete(&mut self, keys: &[Key]) -> Result<usize> {
         self.stage(keys);
-        let head = self.backend.head();
+        let head = self.backend.head(&self.executor);
         let count = present(&head, self.backend.records, &self.keys, &mut self.arena, &mut self.rows)?;
-        self.gather_found();
+        gather_found(&self.keys, &self.rows, &mut self.found);
         head.remove(self.backend.records, self.found.as_slice(), self.backend.writes)
             .map_err(|e| e.to_string())?;
         Ok(count)
@@ -498,7 +553,7 @@ impl DocumentSession for UStoreSession<'_> {
             begin = end;
         }
         self.backend
-            .head()
+            .head(&self.executor)
             .docs_write(
                 self.backend.records,
                 entries.as_slice(),
@@ -518,7 +573,7 @@ impl DocumentSession for UStoreSession<'_> {
         }
         self.stage(keys);
         let count = self.present_documents()?;
-        let head = self.backend.head();
+        let head = self.backend.head(&self.executor);
         let mut fields = Vec::with_capacity_in(count, System);
         fields.extend(
             self.rows
@@ -537,9 +592,9 @@ impl DocumentSession for UStoreSession<'_> {
     fn delete(&mut self, keys: &[Key]) -> Result<usize> {
         self.stage(keys);
         let count = self.present_documents()?;
-        self.gather_found();
+        gather_found(&self.keys, &self.rows, &mut self.found);
         self.backend
-            .head()
+            .head(&self.executor)
             .docs_remove(self.backend.records, self.found.as_slice(), self.backend.writes)
             .map_err(|e| e.to_string())?;
         Ok(count)
@@ -561,17 +616,11 @@ impl DocumentSession for UStoreSession<'_> {
 impl GraphSession for UStoreSession<'_> {
     fn insert(&mut self, keys: &[Key], values: &GraphInput<'_>) -> Result<usize> {
         self.stage_vertices(keys, values)?;
-        let mut entries = Vec::with_capacity_in(keys.len(), System);
-        entries.extend(
-            self.keys
-                .iter()
-                .zip(&self.versions)
-                .map(|(&key, version)| Entry::new(key, version)),
-        );
+        let entries = self.version_entries();
         let backend = self.backend;
         let mut transaction = backend.database.transaction().map_err(|e| e.to_string())?;
         {
-            let view = transaction.on(&backend.executor);
+            let view = transaction.on(&self.executor);
             view.graph_write_edges(backend.edges, self.edges.as_slice(), ustore::Durability::Buffered)
                 .map_err(|e| e.to_string())?;
             view.write(backend.records, entries.as_slice(), ustore::Durability::Buffered)
@@ -583,14 +632,8 @@ impl GraphSession for UStoreSession<'_> {
     /// Writes at the head, since nothing reads during a load and its batches outgrow a transaction's buffer.
     fn bulk_load(&mut self, keys: &[Key], values: &GraphInput<'_>) -> Result<usize> {
         self.stage_vertices(keys, values)?;
-        let mut entries = Vec::with_capacity_in(keys.len(), System);
-        entries.extend(
-            self.keys
-                .iter()
-                .zip(&self.versions)
-                .map(|(&key, version)| Entry::new(key, version)),
-        );
-        let head = self.backend.head();
+        let entries = self.version_entries();
+        let head = self.backend.head(&self.executor);
         head.graph_write_edges(self.backend.edges, self.edges.as_slice(), self.backend.writes)
             .map_err(|e| e.to_string())?;
         head.write(self.backend.records, entries.as_slice(), self.backend.writes)
@@ -609,9 +652,9 @@ impl GraphSession for UStoreSession<'_> {
         let backend = self.backend;
         let mut transaction = backend.database.transaction().map_err(|e| e.to_string())?;
         let count = {
-            let view = transaction.on(&backend.executor);
+            let view = transaction.on(&self.executor);
             let count = present(&view, backend.records, &self.keys, &mut self.arena, &mut self.rows)?;
-            self.gather_found();
+            gather_found(&self.keys, &self.rows, &mut self.found);
             let neighborhoods = view
                 .graph_read_edges(
                     backend.edges,
@@ -662,9 +705,9 @@ impl GraphSession for UStoreSession<'_> {
         let backend = self.backend;
         let mut transaction = backend.database.transaction().map_err(|e| e.to_string())?;
         let count = {
-            let view = transaction.on(&backend.executor);
+            let view = transaction.on(&self.executor);
             let count = present(&view, backend.records, &self.keys, &mut self.arena, &mut self.rows)?;
-            self.gather_found();
+            gather_found(&self.keys, &self.rows, &mut self.found);
             view.remove(backend.records, self.found.as_slice(), ustore::Durability::Buffered)
                 .map_err(|e| e.to_string())?;
             view.graph_remove_vertices(
@@ -693,7 +736,7 @@ impl GraphSession for UStoreSession<'_> {
     }
     fn expand_neighbors(&mut self, start: Key, limit: usize, keys: &mut KeysOutput<'_>) -> Result<usize> {
         keys.clear();
-        let head = self.backend.head();
+        let head = self.backend.head(&self.executor);
         let origin = to_store(&start);
         let first = head
             .graph_read_edges(
@@ -741,7 +784,15 @@ fn main() -> Result<()> {
         &settings,
         move |args, path| {
             Ok(Box::new_in(
-                UStoreBackend::open(path, cli.engine, args.data_model, args.durability, cli.executor_threads)?,
+                UStoreBackend::open(
+                    path,
+                    &args.further_data_dirs(path),
+                    cli.engine,
+                    args.data_model,
+                    args.durability,
+                    args.threads[0].0.get(),
+                    cli.executor_threads,
+                )?,
                 System,
             ))
         },
@@ -753,7 +804,7 @@ mod tests {
     use super::*;
 
     fn opened(engine: Engine, data_model: DataModel, directory: &tempfile::TempDir) -> UStoreBackend {
-        UStoreBackend::open(directory.path(), engine, data_model, Durability::None, 2).unwrap()
+        UStoreBackend::open(directory.path(), &[], engine, data_model, Durability::None, 1, 2).unwrap()
     }
 
     #[test]
@@ -762,6 +813,24 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             crudeval::assert_backend_contract!(&opened(engine, DataModel::KeyValue, &directory));
         }
+    }
+
+    #[test]
+    fn data_directories_contract() {
+        let directories = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let further = [directories[1].path().to_path_buf()];
+        let backend = UStoreBackend::open(
+            directories[0].path(),
+            &further,
+            Engine::NVME,
+            DataModel::KeyValue,
+            Durability::None,
+            1,
+            2,
+        )
+        .unwrap();
+        crudeval::assert_backend_contract!(&backend);
+        assert!(backend.capabilities().multiple_data_dirs);
     }
 
     #[test]

@@ -74,7 +74,6 @@ pub struct ConfigReport {
 
 pub fn collect_machine_info() -> MachineInfo {
     let system = sysinfo::System::new_all();
-    let disks = sysinfo::Disks::new_with_refreshed_list();
     MachineInfo {
         cpu_model: system.cpus().first().map(|c| c.brand().to_owned()).unwrap_or_default(),
         logical_cores: system.cpus().len(),
@@ -83,17 +82,44 @@ pub fn collect_machine_info() -> MachineInfo {
         kernel: sysinfo::System::kernel_version(),
         os: sysinfo::System::long_os_version(),
         architecture: std::env::consts::ARCH,
-        disks: disks
-            .iter()
-            .map(|disk| DiskInfo {
-                name: disk.name().to_string_lossy().into_owned(),
-                mount_point: disk.mount_point().to_path_buf(),
-                file_system: disk.file_system().to_string_lossy().into_owned(),
-                total_bytes: disk.total_space(),
-                available_bytes: disk.available_space(),
-            })
-            .collect(),
+        disks: collect_disks(),
     }
+}
+
+pub fn collect_disks() -> Vec<DiskInfo> {
+    sysinfo::Disks::new_with_refreshed_list()
+        .iter()
+        .map(|disk| DiskInfo {
+            name: disk.name().to_string_lossy().into_owned(),
+            mount_point: disk.mount_point().to_path_buf(),
+            file_system: disk.file_system().to_string_lossy().into_owned(),
+            total_bytes: disk.total_space(),
+            available_bytes: disk.available_space(),
+        })
+        .collect()
+}
+
+/// The disk holding `path`, by its longest containing mount point.
+pub fn disk_of<'a>(disks: &'a [DiskInfo], path: &Path) -> Option<&'a DiskInfo> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    disks
+        .iter()
+        .filter(|disk| path.starts_with(&disk.mount_point))
+        .max_by_key(|disk| disk.mount_point.as_os_str().len())
+}
+
+/// The disk under each directory, which tells a RAID0 volume from separate drives.
+pub fn data_disks<'a>(machine: &MachineInfo, directories: impl Iterator<Item = &'a PathBuf>) -> Value {
+    directories
+        .map(|directory| {
+            let disk = disk_of(&machine.disks, directory);
+            serde_json::json!({
+                "path": directory,
+                "disk": disk.map(|disk| &disk.name),
+                "file_system": disk.map(|disk| &disk.file_system),
+            })
+        })
+        .collect()
 }
 
 pub fn config_hash(value: &impl Serialize) -> Result<String> {

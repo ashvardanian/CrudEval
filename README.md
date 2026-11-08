@@ -7,7 +7,7 @@ It is the Rust successor to UCSB and a sibling of [RetriEval](https://github.com
 One shared runner drives embedded storage engines and database servers, with opt-in document and graph workloads.
 Runs use seeded data, verify returned values, and write latency distributions, throughput, resource usage, and configuration to JSON.
 
-## Quick Start
+## Quickstart
 
 ```sh
 sudo apt-get install build-essential clang libclang-dev cmake pkg-config
@@ -71,7 +71,7 @@ Its updates and deletes read the key first, so they never create or count a miss
 Documents are typed `score bigint` and `payload text` columns, and updates set the `score` column.
 Durability `none` disables the keyspace's `durable_writes`, `buffered` uses periodic commit log sync, and `flushed` uses batch sync.
 ScyllaDB needs direct I/O on its data directory, which Docker Desktop's file sharing on macOS does not provide; run it on Linux.
-UStore opens its NVMe engine through `crudeval.ustore.json` in the run's data directory, and its RAM engine keeps its image there.
+UStore opens its NVMe engine through `crudeval.ustore.json` in the run's first data directory, and its RAM engine keeps its image there.
 Every UStore verb takes the whole batch on the engine's executor; updates and deletes first read which keys exist, without their values.
 UStore documents are JSON, read back as `score` and `payload` columns; graph vertices keep their versions in a blobs collection and their edges in a graph collection, identified by slot, and change in transactions.
 `--durability none` writes as `buffered`, since UStore has no log to disable.
@@ -106,6 +106,7 @@ bulk-load,read,batch-read-256,range-read-256,full-scan,read-50-update-50,read-la
 The numeric suffixes on batch, range, and bulk-load names are configurable: `batch-read-64`, `range-read-1K`, or `bulk-load-10K`.
 Mix percentages are per logical operation; throughput is successful entries per second.
 Bulk-load keys ascend within each batch; concurrent workers may submit batches out of order.
+Under `uuid-v4` they ascend by ordinal rather than by key, so RocksDB sorts each batch before writing its SST file, inside the measured load.
 `--entries 10%` sets each ordinary phase's attempted entry budget relative to the initial record count.
 A final partial batch uses the remaining budget.
 Bulk load always loads `--records`; full scan covers the current live keyspace.
@@ -215,8 +216,8 @@ crud-eval-*
       Time limit per ordinary phase instead of --entries, like 30s or 500ms.
   --value-size <SIZE|RANGE>             1KB
       Binary payload size or range like 100..1KB, at least 24 bytes.
-  --data-dir <DIR>                      data
-      Parent directory for marked benchmark databases.
+  --data-dir <DIR,...>                  data
+      Parent directories for marked benchmark databases, one per drive.
   --output <DIR>                        results
       Directory for JSON reports.
   --seed <SEED>                         42
@@ -328,6 +329,94 @@ uv run scripts/plot.py results/ --output plots/
 
 The plotting script reads the JSON reports and writes throughput, latency, memory, and disk charts as SVG.
 
+### Several Drives
+
+`--data-dir /mnt/nvme0,/mnt/nvme1` gives each configuration a directory under every parent, all with the same name, and the first holds the `.crudeval` marker.
+A bulk load clears the others only when that marker vouches for them, and the number of parents is part of the configuration's identity.
+Only `crud-eval-rocksdb` and `crud-eval-ustore --engine nvme` spread their files; other binaries refuse more than one directory.
+
+- __UStore's NVMe engine__ keeps its manifest in the first directory and lands each sorted run in whichever directory has the most free bytes.
+- __RocksDB__ gets one `db_paths` entry per directory, each targeting its disk's size, and keeps its write-ahead log and manifest in the first.
+  RocksDB places whole levels on the paths in order, passing a level that does not fit the room left to a later path and the rest to the last one, while bulk-loaded SST files always land on the first; it is tiering, not striping.
+  Several paths also turn `level_compaction_dynamic_level_bytes` off, and the targets are soft, so a first disk barely larger than the data can still fill up.
+  A RAID0 volume passed as one `--data-dir` is RocksDB's striped layout.
+
+Every report names the disk and file system under each directory in `data_disks`, so a RAID0 volume reads as one `/dev/md0` and separate drives as one device per directory.
+RocksDB reports `data_layout` and `db_paths` with their target sizes, and UStore reports how many `data_directories` it opened.
+
+### Twelve Drives on AWS
+
+This runbook compares RocksDB with UStore's NVMe engine on an `i8g.48xlarge`: 192 Graviton4 cores, 1.5 TiB of RAM and 12 local 3.75 TB NVMe drives.
+Each run loads 500M records of 1 KB, about 512 GB, then runs five phases of 60 s each.
+Local drives vanish on a spot interruption, so every run copies its JSON reports to S3 as soon as it ends, and a background loop copies them every minute in between.
+Build both binaries first, with the packages from the [Quickstart](#quickstart):
+
+```sh
+cargo build --release --no-default-features --features rocksdb-backend,ustore-backend \
+    --bin crud-eval-rocksdb --bin crud-eval-ustore
+export RESULTS_S3=s3://<bucket>/crudeval/i8g.48xlarge-$(date -u +%Y%m%dT%H%M)
+drives=$(lsblk -d -n -o NAME,MODEL | awk '/Instance Storage/ {print "/dev/" $1}')
+mkdir -p results && (while sleep 60; do aws s3 sync results/ "$RESULTS_S3/" --quiet; done) &
+```
+
+One function runs every configuration the same way.
+Dropping the page cache needs root, the RAM cap keeps the 512 GB dataset well beyond what the page cache may hold, and io_uring needs locked memory:
+
+```sh
+crud() { # crud <rocksdb|ustore> <uuid-v7|uuid-v4> <data dirs, comma-separated>
+    local extra=(); [ "$1" = ustore ] && extra=(--engine nvme)
+    sudo systemd-run --scope --collect -p MemoryMax=128G -p MemorySwapMax=0 \
+        prlimit --memlock=unlimited target/release/crud-eval-$1 "${extra[@]}" \
+        --records 500M --value-size 1KB --threads 0 --key-type "$2" \
+        --data-model key-value --durability buffered --between-workloads reopen-and-drop-caches \
+        --time-limit 60s --workloads bulk-load,read,read-95-update-5,read-50-read-modify-write-50,range-read-256,full-scan \
+        --data-dir "$3" --output results/ 2>&1 | tee -a "results/$1-$2-$(date -u +%H%M).log"
+    aws s3 sync results/ "$RESULTS_S3/"
+}
+```
+
+First the native layout, one XFS file system per drive:
+
+```sh
+i=0; for drive in $drives; do
+    sudo mkfs.xfs -f -K "$drive" && sudo mkdir -p /mnt/nvme$i && sudo mount -o noatime "$drive" /mnt/nvme$i
+    i=$((i + 1))
+done
+sudo chown "$USER" /mnt/nvme*
+native=$(ls -d /mnt/nvme* | sort -V | paste -sd,)
+crud ustore uuid-v7 "$native"
+crud ustore uuid-v4 "$native"
+crud rocksdb uuid-v7 "$native"
+sudo umount /mnt/nvme*
+```
+
+Then the RAID0 baseline, one XFS file system striped over all twelve:
+
+```sh
+sudo wipefs -a $drives
+sudo mdadm --create /dev/md0 --run --level=0 --chunk=512 --raid-devices=12 $drives
+sudo mkfs.xfs -f -K /dev/md0 && sudo mkdir -p /mnt/raid0 && sudo mount -o noatime /dev/md0 /mnt/raid0
+sudo chown "$USER" /mnt/raid0
+crud rocksdb uuid-v7 /mnt/raid0
+crud rocksdb uuid-v4 /mnt/raid0
+crud ustore uuid-v7 /mnt/raid0 # only with 16 minutes to spare
+```
+
+| Run               | Layout | Load     | Compaction   | Phases  | Estimate |
+| :---------------- | :----- | :------- | :----------- | :------ | -------: |
+| `ustore uuid-v7`  | native | 4–17 min | none         | 6–7 min |   16 min |
+| `ustore uuid-v4`  | native | 4–17 min | none         | 5–6 min |   15 min |
+| `rocksdb uuid-v7` | native | 2–4 min  | under 1 min  | 6–7 min |   10 min |
+| `rocksdb uuid-v7` | RAID0  | 2–4 min  | under 1 min  | 6–7 min |   10 min |
+| `rocksdb uuid-v4` | RAID0  | 2–4 min  | about 25 min | 5–6 min |   35 min |
+| `ustore uuid-v7`  | RAID0  | 4–17 min | none         | 6–7 min |   16 min |
+
+The first five runs and the two file system setups take about 1.5 hours; the last run adds 16 minutes.
+The `rocksdb uuid-v4` load ends with a compaction of every overlapping SST file, which RocksDB runs on one thread and which grows with the data.
+It runs only on RAID0, since its native layout would put the same files on the first drive.
+Phase estimates include the reopens between phases and the full scan of 500M records, which `uuid-v4` skips.
+The load and compaction ranges extrapolate small runs on RAM disks and are the least certain part of the estimate.
+
 ## Project Layout
 
 ```text
@@ -397,7 +486,6 @@ The following planned capabilities remain incomplete:
 - Grouped transactions beyond LMDB, redb, SQLite, Turso, and PostgreSQL; UStore uses its own only inside graph mutations.
 - Docker reopen/cache-drop support and continuous server resource sampling; current server statistics are post-phase snapshots.
 - Document field updates beyond `/score`, incoming-neighbor graph reads, and an independent exact verifier for concurrent two-hop traversals.
-- Multiple storage directories; the old multi-disk configuration has no replacement yet.
 - CUDA-equipped cross-project validation requires a suitable runner.
 
 ## Benchmark Pitfalls

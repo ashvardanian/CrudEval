@@ -231,6 +231,7 @@ impl Backend for FalkorDbBackend {
             data_models: &[DataModel::Graph],
             ordered_ranges: true,
             transactions: false,
+            multiple_data_dirs: false,
             batch_read: BatchMode::Native,
             batch_insert: BatchMode::Native,
             batch_update: BatchMode::Native,

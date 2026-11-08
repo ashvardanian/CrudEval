@@ -541,6 +541,8 @@ pub struct BackendCapabilities {
     pub data_models: &'static [DataModel],
     pub ordered_ranges: bool,
     pub transactions: bool,
+    /// Spreads its files over every `--data-dir`.
+    pub multiple_data_dirs: bool,
     pub batch_read: BatchMode,
     pub batch_insert: BatchMode,
     pub batch_update: BatchMode,
@@ -553,6 +555,7 @@ impl Default for BackendCapabilities {
             data_models: &[DataModel::KeyValue],
             ordered_ranges: false,
             transactions: false,
+            multiple_data_dirs: false,
             batch_read: BatchMode::PerRecord,
             batch_insert: BatchMode::PerRecord,
             batch_update: BatchMode::PerRecord,

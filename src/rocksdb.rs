@@ -17,7 +17,7 @@ use std::{
 };
 
 use clap::Parser;
-use rocksdb::{IngestExternalFileOptions, Options, SstFileWriter, WriteBatch, WriteOptions, DB};
+use rocksdb::{DBPath, IngestExternalFileOptions, Options, SstFileWriter, WriteBatch, WriteOptions, DB};
 use serde_json::json;
 
 use crudeval::{
@@ -25,7 +25,7 @@ use crudeval::{
         directory_bytes, Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, Durability, Key, KeyWidth,
         KeysOutput, RecordInput, RecordOutput, Result, TransactionSession,
     },
-    run, Bytes, CommonArgs,
+    output, run, Bytes, CommonArgs,
 };
 
 #[derive(Parser)]
@@ -40,6 +40,8 @@ struct RocksDbBackend {
     db: DB,
     key_width: KeyWidth,
     path: PathBuf,
+    /// Every `db_paths` entry with its target size, or none when the database keeps to `path`.
+    db_paths: Vec<(PathBuf, u64)>,
     durability: Durability,
     write_buffer_size: usize,
     write_options: WriteOptions,
@@ -47,13 +49,36 @@ struct RocksDbBackend {
     ingested: AtomicBool,
 }
 impl RocksDbBackend {
-    fn open(path: &Path, durability: Durability, key_width: KeyWidth, write_buffer_size: usize) -> Result<Self> {
+    fn open(
+        path: &Path,
+        further: &[PathBuf],
+        durability: Durability,
+        key_width: KeyWidth,
+        write_buffer_size: usize,
+    ) -> Result<Self> {
         if write_buffer_size == 0 {
             return Err("write buffer size must be positive".into());
         }
         let mut options = Options::default();
         options.create_if_missing(true);
         options.set_write_buffer_size(write_buffer_size);
+        let mut db_paths = Vec::new();
+        if !further.is_empty() {
+            let disks = output::collect_disks();
+            for directory in std::iter::once(path).chain(further.iter().map(PathBuf::as_path)) {
+                let disk =
+                    output::disk_of(&disks, directory).ok_or(format!("no disk holds {}", directory.display()))?;
+                db_paths.push((directory.to_path_buf(), disk.total_bytes));
+            }
+            let entries = db_paths
+                .iter()
+                .map(|(directory, bytes)| DBPath::new(directory, *bytes))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            options.set_db_paths(&entries);
+            // RocksDB turns dynamic level sizes off under several paths anyway; this states it.
+            options.set_level_compaction_dynamic_level_bytes(false);
+        }
         let db = DB::open(&options, path).map_err(|e| e.to_string())?;
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(durability == Durability::None);
@@ -63,6 +88,7 @@ impl RocksDbBackend {
             key_width,
             write_options,
             path: path.into(),
+            db_paths,
             durability,
             write_buffer_size,
             sst_id: AtomicU64::new(0),
@@ -81,12 +107,25 @@ impl Backend for RocksDbBackend {
             ("durability".into(), json!(self.durability)),
             ("write_buffer_size".into(), json!(self.write_buffer_size)),
             ("conditional_writes".into(), json!("disjoint_deletes")),
+            (
+                "data_layout".into(),
+                json!(match self.db_paths.is_empty() {
+                    true => "one directory",
+                    false => "db_paths, filled in order, each up to its disk's size",
+                }),
+            ),
+            ("db_paths".into(), json!(self.db_paths)),
+            (
+                "level_compaction_dynamic_level_bytes".into(),
+                json!(self.db_paths.is_empty()),
+            ),
         ]);
         metadata
     }
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             ordered_ranges: true,
+            multiple_data_dirs: true,
             batch_read: BatchMode::Native,
             batch_insert: BatchMode::Native,
             batch_update: BatchMode::Native,
@@ -107,7 +146,14 @@ impl Backend for RocksDbBackend {
         Ok(())
     }
     fn disk_bytes(&self) -> Result<u64> {
-        directory_bytes(&self.path)
+        match self.db_paths.is_empty() {
+            true => directory_bytes(&self.path),
+            false => self
+                .db_paths
+                .iter()
+                .map(|(directory, _)| directory_bytes(directory))
+                .sum(),
+        }
     }
 }
 struct RocksDbSession<'a>(&'a RocksDbBackend);
@@ -262,10 +308,17 @@ impl BackendSession for RocksDbSession<'_> {
         let options = Options::default();
         let mut writer = SstFileWriter::create(&options);
         writer.open(&path).map_err(|e| e.to_string())?;
+        // An SST file takes its keys in ascending order, which ordinals follow under uuid-v7 but not uuid-v4.
+        let mut order = Vec::with_capacity_in(keys.len(), System);
+        order.extend(0..keys.len());
+        order.sort_unstable_by_key(|&i| keys[i]);
         let result = (|| {
-            for (i, key) in keys.iter().enumerate() {
+            for i in order {
                 writer
-                    .put(self.0.key_width.bytes(key), values.get(i).ok_or("missing input value")?)
+                    .put(
+                        self.0.key_width.bytes(&keys[i]),
+                        values.get(i).ok_or("missing input value")?,
+                    )
                     .map_err(|e| e.to_string())?;
             }
             writer.finish().map_err(|e| e.to_string())?;
@@ -297,6 +350,7 @@ fn main() -> Result<()> {
             Ok(Box::new_in(
                 RocksDbBackend::open(
                     path,
+                    &args.further_data_dirs(path),
                     args.durability,
                     args.key_width()?,
                     usize::try_from(cli.write_buffer_size.0).map_err(|_| "write buffer size exceeds platform limit")?,
@@ -315,7 +369,46 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = RocksDbBackend::open(path, Durability::None, KeyWidth::U64, 8 << 20).unwrap();
+        let db = RocksDbBackend::open(path, &[], Durability::None, KeyWidth::U64, 8 << 20).unwrap();
+        crudeval::assert_backend_contract!(&db);
+    }
+
+    #[test]
+    fn bulk_load_sorts_scattered_keys() {
+        use crudeval::backend::RecordBatch;
+
+        let directory = tempfile::tempdir().unwrap();
+        let db = RocksDbBackend::open(directory.path(), &[], Durability::None, KeyWidth::U128, 8 << 20).unwrap();
+        let keys = [Key::from_u128(9 << 64), Key::from_u128(3), Key::from_u128(5 << 32)];
+        let mut values = RecordBatch::new(3, 64);
+        {
+            let mut out = values.as_output();
+            for value in [b"nine", b"tri_", b"five"] {
+                out.push(Some(value)).unwrap();
+            }
+        }
+        let mut session = db.session().unwrap();
+        assert_eq!(session.bulk_load(&keys, &values.as_input()).unwrap(), 3);
+        let mut output = RecordBatch::new(3, 64);
+        assert_eq!(session.read(&keys, &mut output.as_output()).unwrap(), 3);
+        assert_eq!(output.as_input().get(0), Some(b"nine".as_slice()));
+        assert_eq!(output.as_input().get(1), Some(b"tri_".as_slice()));
+    }
+
+    #[test]
+    fn db_paths_contract() {
+        let directories = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let further = [directories[1].path().to_path_buf()];
+        let db = RocksDbBackend::open(
+            directories[0].path(),
+            &further,
+            Durability::None,
+            KeyWidth::U64,
+            8 << 20,
+        )
+        .unwrap();
+        assert_eq!(db.db_paths.len(), 2);
+        assert!(db.db_paths.iter().all(|&(_, bytes)| bytes > 0));
         crudeval::assert_backend_contract!(&db);
     }
 }

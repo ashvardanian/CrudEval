@@ -1,6 +1,7 @@
 [package]
 name = "crudeval"
 version = "1.0.0-rc.1"
+license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.100"
 description = "Create, Read, Update and Delete benchmarks at crude hardware speeds"
@@ -90,6 +91,7 @@ memmap2 = "0.9"
 sysinfo = { version = "0.39", default-features = false, features = [
     "system",
     "disk",
+    "linux-tmpfs",
 ] }
 libc = "0.2"
 rocksdb = { version = "0.25", optional = true, default-features = false, features = [
@@ -119,7 +121,7 @@ turso = { version = "=0.8.1", optional = true, default-features = false }
 ureq = { version = "3", optional = true, default-features = false, features = [
     "json",
 ] }
-ustore = { version = "1.0.0-rc.1", optional = true, default-features = false, features = [
+ustore = { version = "1.0.0-rc.1", git = "https://github.com/unum-cloud/UStore", optional = true, default-features = false, features = [
     "nvme",
 ] }
 
