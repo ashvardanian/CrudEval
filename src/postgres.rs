@@ -22,7 +22,7 @@ use crudeval::{
         GraphSession, Key, KeyWidth, KeysOutput, RecordInput, RecordOutput, Result, TransactionSession, VertexRef,
     },
     docker::ContainerHandle,
-    run, BetweenWorkloads, CommonArgs,
+    run, BetweenRuns, CommonArgs,
 };
 
 #[derive(Parser)]
@@ -58,8 +58,8 @@ const GRAPH_SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS edges_target ON edges(target)";
 
 fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
-    if args.between_workloads != BetweenWorkloads::Keep {
-        return Err("Docker backends support only --between-workloads keep".into());
+    if args.between_runs != BetweenRuns::Keep {
+        return Err("Docker backends support only --between-runs keep".into());
     }
     let sync = if args.durability == Durability::Flushed {
         "on"
@@ -71,6 +71,8 @@ fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
     } else {
         "on"
     };
+    // Every worker holds a connection and `flush` opens one more; the shipped 100 stays unless they need more.
+    let connections = (args.threads[0].0.get() + 1).max(100);
     let container = ContainerHandle::start(
         "postgres:18.6",
         5432,
@@ -83,6 +85,8 @@ fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
             &format!("fsync={fsync}"),
             "-c",
             &format!("synchronous_commit={sync}"),
+            "-c",
+            &format!("max_connections={connections}"),
         ],
     )?;
     let url = format!(
@@ -131,6 +135,7 @@ impl Backend for PostgresBackend {
             data_models: &[DataModel::KeyValue, DataModel::Documents, DataModel::Graph],
             ordered_ranges: true,
             transactions: true,
+            multiple_data_dirs: false,
             batch_read: BatchMode::Native,
             batch_insert: BatchMode::Native,
             batch_update: BatchMode::Native,

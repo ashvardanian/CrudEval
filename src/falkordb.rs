@@ -21,7 +21,7 @@ use crate::cypher::{CypherConnection, CypherOutput, CypherSession, GraphRow, Par
 use crudeval::{
     backend::{Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, Durability, Key, Result},
     docker::ContainerHandle,
-    run, BetweenWorkloads, CommonArgs,
+    run, BetweenRuns, CommonArgs,
 };
 
 #[derive(Parser)]
@@ -159,8 +159,8 @@ impl CypherConnection for FalkorDbConnection {
     }
 }
 fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
-    if args.between_workloads != BetweenWorkloads::Keep {
-        return Err("Docker backends support only --between-workloads keep".into());
+    if args.between_runs != BetweenRuns::Keep {
+        return Err("Docker backends support only --between-runs keep".into());
     }
 
     if args.data_model != DataModel::Graph {
@@ -222,6 +222,14 @@ impl Backend for FalkorDbBackend {
                 ("backend".into(), json!("falkordb")),
                 ("image".into(), json!("falkordb/falkordb:6.0.0")),
                 ("durability".into(), json!(self.durability)),
+                (
+                    "flush".into(),
+                    json!(if self.durability == Durability::None {
+                        "none; no persistence requested"
+                    } else {
+                        "none; appendfsync syncs the AOF"
+                    }),
+                ),
             ]);
             metadata
         }
@@ -248,9 +256,8 @@ impl Backend for FalkorDbBackend {
         ))
     }
     fn flush(&self) -> Result<()> {
-        redis::cmd("SAVE")
-            .query::<()>(&mut self.client.get_connection().map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())
+        // FalkorDB keeps its graph in memory, and its only checkpoint rewrites the whole dataset.
+        Ok(())
     }
     fn server_usage(&self) -> Result<Option<Value>> {
         self.container.stats().map(Some)

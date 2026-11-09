@@ -26,7 +26,7 @@ use crudeval::{
         GraphSession, Key, KeysOutput, Result, TransactionSession, VertexRef,
     },
     docker::ContainerHandle,
-    run, BetweenWorkloads, CommonArgs,
+    run, BetweenRuns, CommonArgs,
 };
 
 const IMAGE: &str = "surrealdb/surrealdb:v3.3.0";
@@ -195,8 +195,8 @@ impl SurrealSession {
     }
 }
 fn open(args: &CommonArgs, path: &Path) -> Result<Box<dyn Backend, System>> {
-    if args.between_workloads != BetweenWorkloads::Keep {
-        return Err("Docker backends support only --between-workloads keep".into());
+    if args.between_runs != BetweenRuns::Keep {
+        return Err("Docker backends support only --between-runs keep".into());
     }
     if args.data_model == DataModel::KeyValue {
         return Err("SurrealDB supports documents and native graphs".into());
@@ -250,6 +250,7 @@ impl Backend for SurrealBackend {
             ("rpc_insert_payload_limit_bytes".into(),json!(RPC_PAYLOAD_LIMIT)),
             ("storage".into(), json!("SurrealKV")),
             ("durability".into(), json!("flushed")),
+            ("flush".into(), json!("none; sync=every syncs every commit")),
             (
                 "graph_storage".into(),
                 json!("native RELATE edges; incident edges removed on vertex deletion"),
@@ -280,6 +281,7 @@ impl Backend for SurrealBackend {
         ))
     }
     fn flush(&self) -> Result<()> {
+        // SurrealKV opened with `sync=every` syncs every commit, and SurrealQL has no checkpoint statement.
         Ok(())
     }
     fn disk_bytes(&self) -> Result<u64> {

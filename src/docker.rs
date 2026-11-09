@@ -85,13 +85,21 @@ impl ContainerHandle {
         let host_port = startup.host_port.map_or_else(String::new, |port| port.to_string());
         let publish = format!("127.0.0.1:{host_port}:{port}");
         let mount = format!("type=bind,src={},dst={storage}", path.display());
-        let mut args = Vec::with_capacity_in(6 + env.len() * 2 + command.len(), System);
+        let budget = crate::output::budget();
+        let memory = format!("{}b", budget.memory_limit);
+        let mut args = Vec::with_capacity_in(12 + env.len() * 2 + command.len(), System);
         args.extend([
             "create".to_owned(),
             "--publish".into(),
             publish,
             "--mount".into(),
             mount,
+            "--cpuset-cpus".into(),
+            budget.cpus.clone(),
+            "--memory".into(),
+            memory.clone(),
+            "--memory-swap".into(),
+            memory,
         ]);
         if let Some(network) = startup.network {
             args.extend(["--network".into(), network.id.clone()]);

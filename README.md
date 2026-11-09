@@ -91,6 +91,7 @@ bulk-load,read,batch-read-256,range-read-256,full-scan,read-50-update-50,read-la
 | UCSB / YCSB    | Workload                       | Meaning                                                |
 | :------------- | :----------------------------- | :----------------------------------------------------- |
 | Init           | `bulk-load`                    | Load fresh sequential keys in batches of up to 100,000 |
+|                | `ingest`                       | Load the same batches through the native bulk path     |
 | Read / C       | `read`                         | Read one existing key                                  |
 | BatchRead      | `batch-read-256`               | Read up to 256 distinct keys per call                  |
 | RangeSelect    | `range-read-256`               | Inclusive ordered range, at most 256 entries           |
@@ -103,13 +104,16 @@ bulk-load,read,batch-read-256,range-read-256,full-scan,read-50-update-50,read-la
 | BatchUpsert    | `batch-insert-1000`            | Insert 1,000 fresh keys per call                       |
 | Remove         | `delete-oldest`                | Delete oldest live keys up to the phase budget         |
 
-The numeric suffixes on batch, range, and bulk-load names are configurable: `batch-read-64`, `range-read-1K`, or `bulk-load-10K`.
+The numeric suffixes on batch, range, bulk-load and ingest names are configurable: `batch-read-64`, `range-read-1K`, or `bulk-load-10K`.
+`bulk-load` writes through each engine's ordinary batched inserts; `ingest` takes its native bulk path, such as RocksDB's sorted SST files, and is reported as its own row.
 Mix percentages are per logical operation; throughput is successful entries per second.
 Bulk-load keys ascend within each batch; concurrent workers may submit batches out of order.
-Under `uuid-v4` they ascend by ordinal rather than by key, so RocksDB sorts each batch before writing its SST file, inside the measured load.
+Under `uuid-v4` they ascend by ordinal rather than by key, so RocksDB's `ingest` sorts each batch before writing its SST file, inside the measured load.
 `--entries 10%` sets each ordinary phase's attempted entry budget relative to the initial record count.
 A final partial batch uses the remaining budget.
 Bulk load always loads `--records`; full scan covers the current live keyspace.
+A load's throughput includes the flush after it, which every engine runs before the next phase.
+Every other phase except the full scan first runs untimed for `--warmup`, then the timed run starts from that steady state.
 `--time-limit 30s` replaces the ordinary phases' entry budget with a time limit, in whole `ms` or `s`.
 The limit stops new work; in-flight operations and the final transaction commit may finish afterward.
 
@@ -204,8 +208,8 @@ The flag on the command line overrides the variable, and `--perf-counters` reads
 crud-eval-*
   --records <N,...>                     100K
       Initial record counts, with decimal K, M, G or T; a sweep.
-  --threads <N,...>                     1
-      Worker counts, 0 for all cores; a sweep.
+  --threads <N,...>                     0
+      Worker counts, 0 for every core in the affinity mask; a sweep.
   --workloads <NAME,...>                the nine-phase chain
       Ordered workload names, run as one chain.
   --distribution <DISTRIBUTION>         per workload
@@ -214,6 +218,8 @@ crud-eval-*
       Attempted entries per ordinary phase, a count like 20K or a share of records.
   --time-limit <DURATION>               unset
       Time limit per ordinary phase instead of --entries, like 30s or 500ms.
+  --warmup <DURATION>                   30s
+      Untimed run of each ordinary phase before its timed run; 0s skips it.
   --value-size <SIZE|RANGE>             1KB
       Binary payload size or range like 100..1KB, at least 24 bytes.
   --data-dir <DIR,...>                  data
@@ -224,6 +230,8 @@ crud-eval-*
       Seed for data and per-worker generators, or random.
   --durability <POLICY>                 none
       Requested write durability: none, buffered or flushed.
+  --memory-limit <SIZE>                 the cgroup's limit
+      Memory the engine may use, page cache included, at most the cgroup's limit; servers get it as their container's.
   --data-model <MODEL>                  key-value
       key-value, documents or graph.
   --key-type <TYPE>                     uuid-v7
@@ -240,7 +248,7 @@ crud-eval-*
       values checks payloads and structure, structure skips payload checks.
   --perf-counters                       off
       Record worker hardware counters; Linux and the perf-counters feature only.
-  --between-workloads <POLICY>          keep
+  --between-runs <POLICY>               keep
       keep, reopen, or reopen-and-drop-caches on Linux; embedded engines only.
 ```
 
@@ -250,23 +258,9 @@ crud-eval-*
 <summary>Engine flags</summary>
 
 ```text
-crud-eval-sqlite
-  --cache-size <SIZE>                   64MB
-      Page cache per session.
-
-crud-eval-lmdb
-  --map-size <SIZE>                     1TB
-      Largest database the memory map can hold.
-
-crud-eval-rocksdb
-  --write-buffer-size <SIZE>            128MB
-      Memtable size before a flush.
-
 crud-eval-redis
   --server <SERVER>                     redis
       redis, valkey, dragonfly, garnet or kvrocks.
-  --dragonfly-threads <N>               automatic
-      I/O threads with --server dragonfly, when the automatic choice exceeds the memory budget.
 
 crud-eval-mongodb, crud-eval-neo4j
   --server <SERVER>                     per binary
@@ -281,8 +275,6 @@ crud-eval-scylladb
 crud-eval-ustore
   --engine <ENGINE>                     nvme
       nvme, or ram, which keeps its image in the data directory.
-  --executor-threads <N>                0
-      Executor threads, 0 to derive them from the cores.
 ```
 
 </details>
@@ -298,7 +290,7 @@ crud-eval-ustore
 | Engine `.cfg` files                  | Typed engine-specific CLI options                    |
 | `operations_count`                   | `--entries` or `--time-limit`                        |
 | `value_length`                       | `--value-size`                                       |
-| `run.py -dp`                         | `--between-workloads reopen-and-drop-caches`         |
+| `run.py -dp`                         | `--between-runs reopen-and-drop-caches`              |
 | Nested merged Google Benchmark files | One `<backend>-<config-hash>.json` per configuration |
 
 A chain beginning with bulk load replaces only its own marked benchmark directory.
@@ -306,7 +298,7 @@ Unmarked existing directories are never cleared.
 A chain without bulk load reuses that configuration's data and restores the live key range saved after its last successful phase.
 Interrupted or failed mutations leave the dataset marked dirty; reload it before another run.
 Do not run two copies of the same configuration against the same data directory concurrently.
-The server adapters accept only `--between-workloads keep`; embedded adapters close and reopen between phases when requested.
+The server adapters accept only `--between-runs keep`; embedded adapters close and reopen between phases when requested.
 Dropping the page cache requires Linux permissions and affects the whole host.
 It does not provide a separate process or machine for each phase.
 
@@ -368,7 +360,7 @@ crud() { # crud <rocksdb|ustore> <uuid-v7|uuid-v4> <data dirs, comma-separated>
     sudo systemd-run --scope --collect -p MemoryMax=128G -p MemorySwapMax=0 \
         prlimit --memlock=unlimited target/release/crud-eval-$1 "${extra[@]}" \
         --records 500M --value-size 1KB --threads 0 --key-type "$2" \
-        --data-model key-value --durability buffered --between-workloads reopen-and-drop-caches \
+        --data-model key-value --durability buffered --between-runs reopen-and-drop-caches \
         --time-limit 60s --workloads bulk-load,read,read-95-update-5,read-50-read-modify-write-50,range-read-256,full-scan \
         --data-dir "$3" --output results/ 2>&1 | tee -a "results/$1-$2-$(date -u +%H%M).log"
     aws s3 sync results/ "$RESULTS_S3/"
@@ -416,6 +408,7 @@ The `rocksdb uuid-v4` load ends with a compaction of every overlapping SST file,
 It runs only on RAID0, since its native layout would put the same files on the first drive.
 Phase estimates include the reopens between phases and the full scan of 500M records, which `uuid-v4` skips.
 The load and compaction ranges extrapolate small runs on RAM disks and are the least certain part of the estimate.
+
 
 ## Project Layout
 
@@ -495,7 +488,31 @@ The following planned capabilities remain incomplete:
 Acknowledging a write in memory differs from acknowledging it after a durable log flush.
 `--durability none`, `buffered`, and `flushed` make the requested policy explicit; metadata records the engine's actual settings.
 Some engines cannot disable logging, and stronger behavior must not be presented as equivalent to a log-free write.
-MongoDB requires `buffered` or `flushed`; Neo4j and Memgraph require `flushed`.
+An engine that cannot honour a level rejects it rather than running a stronger or weaker one.
+`flush` runs after every phase: engines with a log and store files checkpoint, while in-memory servers, whose only checkpoint rewrites the whole dataset, rely on their log.
+
+| Engine        | `none`                   | `buffered`                        | `flushed`                        | `flush`                  |
+| :------------ | :----------------------- | :-------------------------------- | :------------------------------- | :----------------------- |
+| RocksDB       | WAL off                  | WAL, no sync                      | WAL synced per write             | memtables and WAL synced |
+| LMDB          | `NO_SYNC`                | rejected                          | sync per commit                  | `force_sync`             |
+| redb          | `Durability::None`       | rejected                          | `Immediate`                      | an `Immediate` commit    |
+| fjall         | no journal persist       | `PersistMode::Buffer`             | `PersistMode::SyncAll`           | `SyncAll`                |
+| SQLite        | WAL, `synchronous=OFF`   | WAL, `synchronous=NORMAL`         | WAL, `synchronous=FULL`          | WAL checkpoint           |
+| Turso         | `synchronous=OFF`        | rejected                          | `synchronous=FULL`               | WAL checkpoint           |
+| UStore        | as `buffered`            | log, no sync                      | log synced per commit            | a flushed commit         |
+| PostgreSQL    | `fsync=off`              | `synchronous_commit=off`          | `synchronous_commit=on`          | `CHECKPOINT`             |
+| MongoDB       | rejected                 | journal, no wait                  | `journal=true`                   | `fsync`                  |
+| FerretDB      | Postgres `fsync=off`     | Postgres `synchronous_commit=off` | Postgres `synchronous_commit=on` | Postgres `CHECKPOINT`    |
+| Redis, Valkey | no AOF                   | AOF, `everysec`                   | AOF, `always`                    | none                     |
+| Dragonfly     | no snapshots             | rejected                          | rejected                         | none                     |
+| Garnet        | no AOF                   | AOF, commit every 1,000 ms        | AOF, commit wait                 | `COMMITAOF` with an AOF  |
+| Kvrocks       | WAL off                  | WAL, no sync                      | WAL synced                       | `FLUSHMEMTABLE`          |
+| FalkorDB      | no AOF                   | AOF, `everysec`                   | AOF, `always`                    | none                     |
+| ScyllaDB      | `durable_writes = false` | periodic commit log sync          | batch commit log sync            | `nodetool flush`         |
+| Neo4j         | rejected                 | rejected                          | transaction log                  | `db.checkpoint()`        |
+| Memgraph      | rejected                 | rejected                          | WAL flushed per commit           | none                     |
+| SurrealDB     | rejected                 | rejected                          | SurrealKV `sync=every`           | none                     |
+
 Device firmware and power-loss protection also affect what a successful flush guarantees.
 
 LSM engines update a sorted memtable in RAM and, when logging is enabled, append to a write-ahead log (WAL) for recovery.
@@ -511,8 +528,7 @@ Other policies make different tradeoffs; see the [RocksDB leveled-compaction gui
 
 Compaction rewrites existing data, increasing host writes relative to application writes, and can outlast the foreground workload.
 The [RocksDB tuning guide](https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide) explains this write amplification and its tradeoffs with read and space amplification.
-RocksDB's bulk-load flush includes compaction, outside the measured load phase.
-Keep that separate time when comparing ingestion costs.
+RocksDB's `ingest` flush includes the compaction of its ingested files, and a load's throughput counts that flush.
 
 ### Engine & OS Caches
 

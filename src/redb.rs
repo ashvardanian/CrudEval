@@ -24,7 +24,7 @@ use crudeval::{
         directory_bytes, Backend, BackendCapabilities, BackendSession, DataModel, Durability, Key, KeyWidth,
         KeysOutput, RecordInput, RecordOutput, Result, TransactionSession,
     },
-    run, CommonArgs,
+    output, run, CommonArgs,
 };
 
 const RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("records");
@@ -38,11 +38,20 @@ struct RedbBackend {
     key_width: KeyWidth,
     path: PathBuf,
     durability: Durability,
+    cache_size: usize,
 }
 impl RedbBackend {
     fn open(path: &Path, durability: Durability, key_width: KeyWidth) -> Result<Self> {
+        if durability == Durability::Buffered {
+            return Err("redb has no log to buffer; its Immediate commits sync, so use none or flushed".into());
+        }
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
-        let db = Database::create(path.join("redb.db")).map_err(|e| e.to_string())?;
+        // redb ships a 1 GiB cache, kept unless the budget is smaller.
+        let cache_size = output::budget().memory_limit.min(1 << 30) as usize;
+        let db = Database::builder()
+            .set_cache_size(cache_size)
+            .create(path.join("redb.db"))
+            .map_err(|e| e.to_string())?;
         let tx = db.begin_write().map_err(|e| e.to_string())?;
         tx.open_table(RECORDS).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -51,14 +60,14 @@ impl RedbBackend {
             key_width,
             path: path.into(),
             durability,
+            cache_size,
         })
     }
     fn write(&self) -> Result<redb::WriteTransaction> {
         let mut tx = self.db.begin_write().map_err(|e| e.to_string())?;
         tx.set_durability(match self.durability {
             Durability::None => redb::Durability::None,
-            Durability::Buffered => redb::Durability::Immediate,
-            Durability::Flushed => redb::Durability::Immediate,
+            Durability::Buffered | Durability::Flushed => redb::Durability::Immediate,
         })
         .map_err(|e| e.to_string())?;
         Ok(tx)
@@ -79,6 +88,7 @@ impl Backend for RedbBackend {
                     "immediate"
                 }),
             ),
+            ("cache_size".into(), json!(self.cache_size)),
         ]);
         metadata
     }

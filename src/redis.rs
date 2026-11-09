@@ -9,7 +9,7 @@
 //!     --bin crud-eval-redis -- --records 100K --threads 4
 //! ```
 
-use std::{alloc::System, collections::BTreeMap, num::NonZeroU16, path::Path};
+use std::{alloc::System, collections::BTreeMap, path::Path};
 
 use clap::{Parser, ValueEnum};
 use redis::{Client, Connection};
@@ -22,7 +22,7 @@ use crudeval::{
         Result, TransactionSession,
     },
     docker::ContainerHandle,
-    run, BetweenWorkloads, CommonArgs,
+    run, BetweenRuns, CommonArgs,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -39,9 +39,6 @@ struct Cli {
     common: CommonArgs,
     #[arg(long, env = "CRUDEVAL_SERVER", value_enum, default_value = "redis")]
     server: Server,
-    /// Dragonfly I/O threads; defaults to the server's automatic selection.
-    #[arg(long, env = "CRUDEVAL_DRAGONFLY_THREADS", value_parser = |text: &str| crudeval::parse_count(text).and_then(|count| u16::try_from(count).ok().and_then(NonZeroU16::new)).ok_or("expected a positive count"))]
-    dragonfly_threads: Option<NonZeroU16>,
 }
 struct RedisBackend {
     container: ContainerHandle,
@@ -49,7 +46,6 @@ struct RedisBackend {
     server: Server,
     durability: Durability,
     image: &'static str,
-    dragonfly_threads: Option<NonZeroU16>,
     data_model: DataModel,
     key_width: KeyWidth,
 }
@@ -62,17 +58,9 @@ struct RedisSession {
     wire: Vec<u8, System>,
 }
 
-fn open(
-    args: &CommonArgs,
-    path: &Path,
-    server: Server,
-    dragonfly_threads: Option<NonZeroU16>,
-) -> Result<Box<dyn Backend, System>> {
-    if dragonfly_threads.is_some() && !matches!(server, Server::Dragonfly) {
-        return Err("--dragonfly-threads requires --server dragonfly".into());
-    }
-    if args.between_workloads != BetweenWorkloads::Keep {
-        return Err("Docker backends support only --between-workloads keep".into());
+fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backend, System>> {
+    if args.between_runs != BetweenRuns::Keep {
+        return Err("Docker backends support only --between-runs keep".into());
     }
 
     if args.data_model == DataModel::Graph {
@@ -148,10 +136,6 @@ fn open(
             "/data/log",
             "--storage-tier",
             "--recover",
-            "--memory",
-            "256m",
-            "--index",
-            "64m",
         ],
         Server::Kvrocks => vec![
             "--bind",
@@ -188,10 +172,6 @@ fn open(
             command.push("--aof-commit-wait");
         }
     }
-    let threads = dragonfly_threads.map(|n| format!("--proactor_threads={n}"));
-    if let Some(threads) = &threads {
-        command.push(threads.as_str());
-    }
     let container = ContainerHandle::start(image, 6379, path, "/data", &[], &command)?;
     let client = Client::open(format!("redis://127.0.0.1:{}/", container.port)).map_err(|e| e.to_string())?;
     container.ready(|| {
@@ -208,7 +188,6 @@ fn open(
             server,
             durability: args.durability,
             image,
-            dragonfly_threads,
             data_model: args.data_model,
             key_width: args.key_width()?,
         },
@@ -223,13 +202,13 @@ impl Backend for RedisBackend {
                 ("backend".into(), json!(format!("{:?}", self.server).to_lowercase())),
                 ("durability".into(), json!(self.durability)),
                 ("image".into(), json!(self.image)),
-                ("dragonfly_threads".into(), json!(self.dragonfly_threads)),
                 (
                     "flush".into(),
-                    json!(if matches!(self.server, Server::Kvrocks) {
-                        "FLUSHMEMTABLE"
-                    } else {
-                        "SAVE"
+                    json!(match self.server {
+                        Server::Kvrocks => "FLUSHMEMTABLE",
+                        Server::Garnet if self.durability != Durability::None => "COMMITAOF",
+                        _ if self.durability == Durability::None => "none; no persistence requested",
+                        _ => "none; appendfsync syncs the AOF",
                     }),
                 ),
                 (
@@ -245,6 +224,7 @@ impl Backend for RedisBackend {
             data_models: &[DataModel::KeyValue, DataModel::Documents],
             ordered_ranges: false,
             transactions: false,
+            multiple_data_dirs: false,
             batch_read: if self.data_model == DataModel::KeyValue || !matches!(self.server, Server::Garnet) {
                 BatchMode::Native
             } else {
@@ -270,14 +250,14 @@ impl Backend for RedisBackend {
         ))
     }
     fn flush(&self) -> Result<()> {
-        if matches!(self.server, Server::Kvrocks) {
-            let mut connection = self.client.get_connection().map_err(|e| e.to_string())?;
-            return redis::cmd("FLUSHMEMTABLE")
-                .query::<()>(&mut connection)
-                .map_err(|e| e.to_string());
-        }
+        // In-memory servers checkpoint only by rewriting the whole dataset, so a flush syncs their log alone.
+        let command = match self.server {
+            Server::Kvrocks => "FLUSHMEMTABLE",
+            Server::Garnet if self.durability != Durability::None => "COMMITAOF",
+            _ => return Ok(()),
+        };
         let mut connection = self.client.get_connection().map_err(|e| e.to_string())?;
-        redis::cmd("SAVE")
+        redis::cmd(command)
             .query::<()>(&mut connection)
             .map_err(|e| e.to_string())
     }
@@ -443,19 +423,12 @@ impl DocumentSession for RedisSession {
 }
 fn main() {
     let cli: Cli = crudeval::parse_cli();
-    let settings = [
-        ("Server", crudeval::spell_value(&cli.server)),
-        (
-            "Dragonfly threads",
-            cli.dragonfly_threads
-                .map_or_else(|| "auto".into(), |threads| threads.to_string()),
-        ),
-    ];
+    let settings = [("Server", crudeval::spell_value(&cli.server))];
     if let Err(error) = run(
         cli.common,
-        json!({"server":format!("{:?}",cli.server),"dragonfly_threads":cli.dragonfly_threads}),
+        json!({"server":format!("{:?}",cli.server)}),
         &settings,
-        |args, path| open(args, path, cli.server, cli.dragonfly_threads),
+        |args, path| open(args, path, cli.server),
     ) {
         eprintln!("{error}");
         std::process::exit(1);
@@ -479,13 +452,7 @@ fn native_protocol_contract() {
             let mut args = Cli::parse_from(["contract"]).common;
             args.data_model = data_model;
             args.durability = Durability::None;
-            let backend = open(
-                &args,
-                path.path(),
-                server,
-                matches!(server, Server::Dragonfly).then_some(NonZeroU16::new(4).unwrap()),
-            )
-            .unwrap();
+            let backend = open(&args, path.path(), server).unwrap();
             match data_model {
                 DataModel::Documents => crudeval::assert_document_contract!(backend.as_ref()),
                 DataModel::Graph => crudeval::assert_graph_contract!(backend.as_ref()),

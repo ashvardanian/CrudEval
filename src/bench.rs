@@ -26,10 +26,10 @@ const IDENTITY_VERSION: u32 = 4;
 /// Version of the `.crudeval` manifest layout.
 const MANIFEST_FORMAT: u32 = 1;
 
-/// What happens to an embedded database between two workloads.
+/// What happens to an embedded database between two timed runs.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum BetweenWorkloads {
+pub enum BetweenRuns {
     Keep,
     Reopen,
     /// Reopen and drop the host page cache; Linux only.
@@ -82,8 +82,8 @@ pub struct CommonArgs {
     /// Initial record counts; comma-separated values form a sweep.
     #[arg(long, env = "CRUDEVAL_RECORDS", value_delimiter = ',', default_value = "100K", value_parser = workload::parse_count)]
     pub records: Vec<u64>,
-    /// Worker counts, 0 for all cores; comma-separated values form a sweep.
-    #[arg(long, env = "CRUDEVAL_THREADS", value_delimiter = ',', default_value = "1", value_parser = parse_threads_flag)]
+    /// Worker counts, 0 for every core in the affinity mask; comma-separated values form a sweep.
+    #[arg(long, env = "CRUDEVAL_THREADS", value_delimiter = ',', default_value = "0", value_parser = parse_threads_flag)]
     pub threads: Vec<Threads>,
     /// Ordered comma-separated workload names.
     #[arg(long, env = "CRUDEVAL_WORKLOADS", value_delimiter = ',', default_value = workload::DEFAULT_WORKLOADS, value_parser = |text: &str| text.parse::<Workload>())]
@@ -97,6 +97,9 @@ pub struct CommonArgs {
     /// Time limit instead of an entry budget, such as 30s or 500ms.
     #[arg(long, env = "CRUDEVAL_TIME_LIMIT", value_parser = parse_duration_flag)]
     pub time_limit: Option<Duration>,
+    /// Untimed run of each ordinary workload before its timed one, such as 30s; 0s skips it.
+    #[arg(long, env = "CRUDEVAL_WARMUP", default_value = "30s", value_parser = |text: &str| match text { "0s" => Ok(Duration::ZERO), _ => parse_duration_flag(text) })]
+    pub warmup: Duration,
     /// Binary payload size or range, such as 1KB or 100..1KB.
     #[arg(long, env = "CRUDEVAL_VALUE_SIZE", default_value = "1KB", value_parser = workload::parse_value_size)]
     #[serde(serialize_with = "serialize_value_size")]
@@ -113,6 +116,9 @@ pub struct CommonArgs {
     /// Requested write durability; adapters report their effective settings.
     #[arg(long, env = "CRUDEVAL_DURABILITY", value_enum, default_value = "none")]
     pub durability: Durability,
+    /// Memory the engine may use, page cache included; at most this process's cgroup limit, which is the default.
+    #[arg(long, env = "CRUDEVAL_MEMORY_LIMIT", value_parser = workload::parse_size)]
+    pub memory_limit: Option<Bytes>,
     /// Storage model to exercise.
     #[arg(long, env = "CRUDEVAL_DATA_MODEL", value_enum, default_value = "key-value")]
     pub data_model: DataModel,
@@ -137,9 +143,9 @@ pub struct CommonArgs {
     /// Record Linux worker hardware counters; requires the perf-counters feature.
     #[arg(long, env = "CRUDEVAL_PERF_COUNTERS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
     pub perf_counters: bool,
-    /// Keep an embedded database open between workloads, reopen it, or also drop the page cache.
-    #[arg(long, env = "CRUDEVAL_BETWEEN_WORKLOADS", value_enum, default_value = "keep")]
-    pub between_workloads: BetweenWorkloads,
+    /// Keep an embedded database open between runs, reopen it, or also drop the page cache.
+    #[arg(long, env = "CRUDEVAL_BETWEEN_RUNS", value_enum, default_value = "keep")]
+    pub between_runs: BetweenRuns,
 }
 
 impl CommonArgs {
@@ -428,7 +434,7 @@ fn drop_page_cache() -> Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Err("--between-workloads reopen-and-drop-caches requires Linux".into())
+        Err("--between-runs reopen-and-drop-caches requires Linux".into())
     }
 }
 
@@ -492,16 +498,12 @@ fn run_benchmarks(
     }) {
         return Err("delete workloads cannot mix insertion or updates".into());
     }
-    let loading = workloads[0].operations[0].0 == Operation::BulkLoad;
-    if workloads
-        .iter()
-        .skip(1)
-        .any(|w| w.operations[0].0 == Operation::BulkLoad)
-    {
+    let loading = workloads[0].operations[0].0.loads();
+    if workloads.iter().skip(1).any(|w| w.operations[0].0.loads()) {
         return Err("bulk-load must be the first workload".into());
     }
-    if args.between_workloads == BetweenWorkloads::ReopenAndDropCaches && !cfg!(target_os = "linux") {
-        return Err("--between-workloads reopen-and-drop-caches requires Linux".into());
+    if args.between_runs == BetweenRuns::ReopenAndDropCaches && !cfg!(target_os = "linux") {
+        return Err("--between-runs reopen-and-drop-caches requires Linux".into());
     }
     let unset = || "none".to_owned();
     eprintln!("- Records: {}", spell_list(&args.records));
@@ -515,6 +517,7 @@ fn run_benchmarks(
         Some(time_limit) => eprintln!("- Time limit: {}", spell_duration(time_limit)),
         None => eprintln!("- Entries: {}", args.entries),
     }
+    eprintln!("- Warmup: {}", spell_duration(args.warmup));
     eprintln!("- Value size: {}", spell_value_size(&args.value_size));
     let data_dirs: Vec<_> = args.data_dir.iter().map(|dir| dir.display().to_string()).collect();
     eprintln!("- Data dir: {}", data_dirs.join(","));
@@ -533,7 +536,10 @@ fn run_benchmarks(
     );
     eprintln!("- Verify: {}", spell_value(&args.verify));
     eprintln!("- Perf counters: {}", args.perf_counters);
-    eprintln!("- Between workloads: {}", spell_value(&args.between_workloads));
+    eprintln!("- Between runs: {}", spell_value(&args.between_runs));
+    let budget = output::Budget::resolve(args.memory_limit.map(|bytes| bytes.0))?.install();
+    eprintln!("- Cores: {} ({})", budget.cores, budget.cpus);
+    eprintln!("- Memory limit: {}", Bytes(budget.memory_limit));
     for (name, value) in backend_settings {
         eprintln!("- {name}: {value}");
     }
@@ -613,7 +619,9 @@ fn run_benchmarks(
                 capabilities: backend.capabilities(),
                 phases: Vec::new(),
             };
-            report.config.insert("key_bytes".into(), 16.into());
+            report
+                .config
+                .insert("key_bytes".into(), config.key_width()?.size().into());
             report.config.insert("adapter_revision".into(), ADAPTER_REVISION.into());
             report.config.insert(
                 "latency_scope".into(),
@@ -654,10 +662,13 @@ fn run_benchmarks(
                 "workload", "entries/s", "p99 (µs)", "missing"
             );
             for (index, workload) in workloads.iter().enumerate() {
-                if index > 0 && args.between_workloads != BetweenWorkloads::Keep {
+                let mut reopen_flush_seconds = 0.0;
+                if index > 0 && args.between_runs != BetweenRuns::Keep {
+                    let flush_start = Instant::now();
                     backend.flush()?;
+                    reopen_flush_seconds = flush_start.elapsed().as_secs_f64();
                     drop(backend);
-                    if args.between_workloads == BetweenWorkloads::ReopenAndDropCaches {
+                    if args.between_runs == BetweenRuns::ReopenAndDropCaches {
                         drop_page_cache()?;
                     }
                     backend = open(&config, &path)?;
@@ -681,16 +692,31 @@ fn run_benchmarks(
                                 | Operation::Delete
                                 | Operation::ReadModifyWrite
                                 | Operation::BulkLoad
+                                | Operation::Ingest
                         )
                     });
                 if mutating {
                     manifest.dirty = true;
                     manifest.write(&path)?;
                 }
-                let mut phase = if skipped {
-                    empty_phase(workload, "skipped", Some("ordered ranges unsupported".into()))
-                } else {
-                    execute_phase(
+                let operation = workload.operations[0].0;
+                let warms_up = !args.warmup.is_zero() && !operation.loads() && operation != Operation::FullScan;
+                let warmup = match warms_up && !skipped {
+                    true => Some(execute_phase(
+                        backend.as_ref(),
+                        &config,
+                        workload,
+                        &keyspace,
+                        &model,
+                        budget,
+                        Some(args.warmup),
+                    )?),
+                    false => None,
+                };
+                let mut phase = match warmup {
+                    _ if skipped => empty_phase(workload, "skipped", Some("ordered ranges unsupported".into())),
+                    Some(warmup) if warmup.status == "failed" => warmup,
+                    _ => execute_phase(
                         backend.as_ref(),
                         &config,
                         workload,
@@ -698,8 +724,9 @@ fn run_benchmarks(
                         &model,
                         budget,
                         args.time_limit,
-                    )?
+                    )?,
                 };
+                phase.reopen_flush_seconds = reopen_flush_seconds;
                 let flush_start = Instant::now();
                 if phase.status != "skipped" {
                     if let Err(error) = backend.flush() {
@@ -708,6 +735,10 @@ fn run_benchmarks(
                         phase.failed += 1;
                     }
                     phase.flush_seconds = flush_start.elapsed().as_secs_f64();
+                    if operation.loads() {
+                        phase.throughput =
+                            phase.entries as f64 / (phase.elapsed_seconds + phase.flush_seconds).max(f64::MIN_POSITIVE);
+                    }
                 }
                 if mutating && phase.status == "completed" {
                     let live = keyspace.live();
@@ -745,6 +776,7 @@ fn empty_phase(workload: &Workload, status: &str, error: Option<String>) -> outp
         status: status.into(),
         elapsed_seconds: 0.0,
         flush_seconds: 0.0,
+        reopen_flush_seconds: 0.0,
         calls: 0,
         entries: 0,
         throughput: 0.0,
@@ -789,7 +821,7 @@ fn execute_phase(
                 let session = backend.session();
                 let live = keyspace.live();
                 let total = match workload.operations[0].0 {
-                    Operation::BulkLoad => args.records[0],
+                    Operation::BulkLoad | Operation::Ingest => args.records[0],
                     Operation::FullScan => live.end - live.start,
                     _ => budget,
                 };
@@ -799,8 +831,12 @@ fn execute_phase(
                     workload,
                     model,
                     target,
-                    time_limit
-                        .filter(|_| !matches!(workload.operations[0].0, Operation::BulkLoad | Operation::FullScan)),
+                    time_limit.filter(|_| {
+                        !matches!(
+                            workload.operations[0].0,
+                            Operation::BulkLoad | Operation::Ingest | Operation::FullScan
+                        )
+                    }),
                 );
                 if barrier.wait().is_leader() {
                     let _ = start.set(Instant::now());
@@ -975,7 +1011,7 @@ impl WorkerRecords {
                 for &key in keys {
                     generator.fill_value(
                         key,
-                        if operation == Operation::BulkLoad {
+                        if operation.loads() {
                             0
                         } else {
                             rng.next_u64() & i64::MAX as u64
@@ -994,7 +1030,7 @@ impl WorkerRecords {
                     for &key in keys {
                         generator.fill_document(
                             key,
-                            if operation == Operation::BulkLoad {
+                            if operation.loads() {
                                 0
                             } else {
                                 rng.next_u64() & i64::MAX as u64
@@ -1019,11 +1055,7 @@ impl WorkerRecords {
                     for &key in keys {
                         generator.fill_vertex(
                             key,
-                            if operation == Operation::BulkLoad {
-                                0
-                            } else {
-                                rng.next_u64()
-                            },
+                            if operation.loads() { 0 } else { rng.next_u64() },
                             floor,
                             scratch,
                             &mut out,
@@ -1080,18 +1112,18 @@ impl WorkerRecords {
     fn write(&mut self, session: &mut WorkerSession<'_>, keys: &[Key], operation: Operation) -> Result<usize> {
         match (self, session) {
             (Self::KeyValue { input, .. }, WorkerSession::KeyValue(s)) => match operation {
-                Operation::BulkLoad => s.bulk_load(keys, &input.as_input()),
-                Operation::Insert => s.insert(keys, &input.as_input()),
+                Operation::Ingest => s.bulk_load(keys, &input.as_input()),
+                Operation::Insert | Operation::BulkLoad => s.insert(keys, &input.as_input()),
                 _ => s.update(keys, &input.as_input()),
             },
             (Self::Documents { input, patches, .. }, WorkerSession::Documents(s)) => match operation {
-                Operation::BulkLoad => s.bulk_load(keys, &input.as_input()),
-                Operation::Insert => s.insert(keys, &input.as_input()),
+                Operation::Ingest => s.bulk_load(keys, &input.as_input()),
+                Operation::Insert | Operation::BulkLoad => s.insert(keys, &input.as_input()),
                 _ => s.update(keys, &patches[..keys.len()]),
             },
             (Self::Graph { input, patches, .. }, WorkerSession::Graph(s)) => match operation {
-                Operation::BulkLoad => s.bulk_load(keys, &input.as_input()),
-                Operation::Insert => s.insert(keys, &input.as_input()),
+                Operation::Ingest => s.bulk_load(keys, &input.as_input()),
+                Operation::Insert | Operation::BulkLoad => s.insert(keys, &input.as_input()),
                 _ => s.update(keys, &patches[..keys.len()]),
             },
             _ => unreachable!(),
@@ -1168,7 +1200,11 @@ impl WorkerRecords {
     fn bytes(&self, operation: Operation, rows: usize) -> u64 {
         let writing = matches!(
             operation,
-            Operation::Insert | Operation::BulkLoad | Operation::Update | Operation::ReadModifyWrite
+            Operation::Insert
+                | Operation::BulkLoad
+                | Operation::Ingest
+                | Operation::Update
+                | Operation::ReadModifyWrite
         );
         let updating = matches!(operation, Operation::Update | Operation::ReadModifyWrite);
         match self {
@@ -1279,7 +1315,7 @@ fn run_worker(
     mut buffers: WorkerBuffers,
 ) -> WorkloadMeasurements {
     let threads = args.threads[0].0.get() as u64;
-    let bulk_load = workload.operations[0].0 == Operation::BulkLoad;
+    let bulk_load = workload.operations[0].0.loads();
     let full_scan = workload.operations[0].0 == Operation::FullScan;
     let mut snapshot = keyspace.live();
     let total = if bulk_load {
@@ -1359,7 +1395,7 @@ fn run_worker(
                 count = count.min(target - attempted);
             }
             buffers.keys.clear();
-            if matches!(operation, Operation::Insert | Operation::BulkLoad) {
+            if operation == Operation::Insert || operation.loads() {
                 let range = keyspace.reserve(thread, count)?;
                 if range.end > generator.keys().capacity() {
                     return Err(format!("keys end at ordinal {}", generator.keys().capacity()));
@@ -1428,7 +1464,7 @@ fn run_worker(
                     }
                 }
             }
-            if matches!(operation, Operation::Insert | Operation::BulkLoad | Operation::Update) {
+            if matches!(operation, Operation::Insert | Operation::Update) || operation.loads() {
                 buffers
                     .records
                     .prepare(generator, &buffers.keys, operation, snapshot.start, &mut rng)?;
@@ -1442,7 +1478,7 @@ fn run_worker(
             let mut scan_count = 0;
             let call = (|| -> Result<usize> {
                 match operation {
-                    Operation::Insert | Operation::BulkLoad | Operation::Update => {
+                    Operation::Insert | Operation::BulkLoad | Operation::Ingest | Operation::Update => {
                         buffers.records.write(&mut session, &buffers.keys, operation)
                     }
                     Operation::Delete => session.delete(&buffers.keys),
@@ -1500,7 +1536,7 @@ fn run_worker(
             if affected > count {
                 return Err("backend returned more entries than requested".into());
             }
-            if matches!(operation, Operation::Insert | Operation::BulkLoad) && affected != count {
+            if (operation == Operation::Insert || operation.loads()) && affected != count {
                 return Err("backend did not insert the complete reserved key range".into());
             }
             if operation == Operation::Read {
@@ -1570,7 +1606,7 @@ fn run_worker(
                 buffers
                     .measurements
                     .publish(start.elapsed(), affected, count - affected, bytes);
-                if matches!(operation, Operation::Insert | Operation::BulkLoad) {
+                if operation == Operation::Insert || operation.loads() {
                     keyspace.acknowledge(thread)?;
                 }
             }
@@ -1806,7 +1842,7 @@ mod tests {
         }
     }
     fn args(extra: &[&str]) -> CommonArgs {
-        let mut argv = vec!["test", "--records", "7", "--value-size", "32"];
+        let mut argv = vec!["test", "--records", "7", "--value-size", "32", "--warmup", "0s"];
         argv.extend_from_slice(extra);
         Cli::parse_from(argv).args
     }
@@ -1846,7 +1882,7 @@ mod tests {
     }
     #[test]
     fn transactions_publish_after_commit_and_failed_commits_publish_nothing() {
-        let args = args(&["--calls-per-transaction", "2"]);
+        let args = args(&["--calls-per-transaction", "2", "--threads", "1"]);
         let model = model();
         for fail_commit in [false, true] {
             let backend = Memory {

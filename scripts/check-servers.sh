@@ -14,10 +14,7 @@ print(f"Validation reports: {root}", flush=True)
 cases = []
 for server in ("redis", "valkey", "dragonfly", "garnet", "kvrocks"):
     for model in ("key-value", "documents"):
-        options = ["--server", server]
-        if server == "dragonfly":
-            options += ["--dragonfly-threads", "4"]
-        cases.append(("redis", options, model, "none", f"{server}-{model}"))
+        cases.append(("redis", ["--server", server], model, "none", f"{server}-{model}"))
 for server in ("mongodb", "ferretdb"):
     for model in ("key-value", "documents"):
         cases.append(("mongodb", ["--server", server], model, "buffered", f"{server}-{model}"))
@@ -34,7 +31,7 @@ for model in ("key-value", "documents"):
 for backend, extra, model, durability, label in cases:
     output = root / label
     command = [f"target/debug/crud-eval-{backend}", *extra, "--records", "64", "--threads", "2",
-               "--entries", "32", "--value-size", "32", "--data-model", model,
+               "--entries", "32", "--warmup", "0s", "--value-size", "32", "--data-model", model,
                "--durability", durability, "--data-dir", str(output / "data"),
                "--output", str(output / "reports")]
     print(label, flush=True)

@@ -22,7 +22,7 @@ use crate::cypher::{CypherConnection, CypherOutput, CypherSession, GraphRow, Par
 use crudeval::{
     backend::{Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, Durability, Key, Result},
     docker::ContainerHandle,
-    run, BetweenWorkloads, CommonArgs,
+    run, BetweenRuns, CommonArgs,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -232,8 +232,8 @@ impl CypherConnection for Neo4jConnection {
 }
 
 fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backend, System>> {
-    if args.between_workloads != BetweenWorkloads::Keep {
-        return Err("Docker backends support only --between-workloads keep".into());
+    if args.between_runs != BetweenRuns::Keep {
+        return Err("Docker backends support only --between-runs keep".into());
     }
 
     if args.data_model != DataModel::Graph {
@@ -274,6 +274,7 @@ fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backen
         .user(user)
         .password(password)
         .db(database)
+        .max_connections(args.threads[0].0.get())
         .build()
         .map_err(|e| e.to_string())?;
     container.ready(|| {
@@ -312,6 +313,13 @@ impl Backend for Neo4jBackend {
                 ("backend".into(), json!(format!("{:?}", self.server).to_lowercase())),
                 ("image".into(), json!(self.image)),
                 ("durability".into(), json!("flushed")),
+                (
+                    "flush".into(),
+                    json!(match self.server {
+                        Server::Neo4j => "CALL db.checkpoint()",
+                        Server::Memgraph => "none; the WAL syncs every commit",
+                    }),
+                ),
             ("read_consistency".into(),json!(if matches!(self.server,Server::Neo4j) {"adjacency bracketed by native revision reads; up to 8 measured attempts, 3 round trips per attempt"}else{"native snapshot query"})),
             ("revision_storage".into(),json!(matches!(self.server,Server::Neo4j))),
             ]);
@@ -323,6 +331,7 @@ impl Backend for Neo4jBackend {
             data_models: &[DataModel::Graph],
             ordered_ranges: true,
             transactions: false,
+            multiple_data_dirs: false,
             batch_read: BatchMode::Native,
             batch_insert: BatchMode::Native,
             batch_update: BatchMode::Native,
@@ -343,7 +352,14 @@ impl Backend for Neo4jBackend {
         ))
     }
     fn flush(&self) -> Result<()> {
-        Ok(())
+        match self.server {
+            Server::Neo4j => self
+                .runtime
+                .block_on(self.graph.run(query("CALL db.checkpoint()")))
+                .map_err(|e| e.to_string()),
+            // Memgraph keeps its graph in memory, its WAL syncs every commit, and its only checkpoint is a full snapshot.
+            Server::Memgraph => Ok(()),
+        }
     }
     fn server_usage(&self) -> Result<Option<Value>> {
         self.container.stats().map(Some)

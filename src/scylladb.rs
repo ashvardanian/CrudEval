@@ -29,7 +29,7 @@ use crudeval::{
         Result, TransactionSession,
     },
     docker::{ContainerHandle, Startup},
-    run, spell_duration, BetweenWorkloads, CommonArgs, Port,
+    run, spell_duration, BetweenRuns, CommonArgs, Port,
 };
 
 const IMAGE: &str = "scylladb/scylla:2026.3.2";
@@ -66,8 +66,8 @@ struct ScyllaBackend {
 struct ScyllaSession<'a>(&'a ScyllaBackend);
 
 fn open(args: &CommonArgs, path: &Path, port: Option<Port>, time_limit: Duration) -> Result<Box<dyn Backend, System>> {
-    if args.between_workloads != BetweenWorkloads::Keep {
-        return Err("Docker backends support only --between-workloads keep".into());
+    if args.between_runs != BetweenRuns::Keep {
+        return Err("Docker backends support only --between-runs keep".into());
     }
     if args.data_model == DataModel::Graph {
         return Err("ScyllaDB supports key-value records and documents, not graphs".into());
@@ -190,6 +190,7 @@ impl Backend for ScyllaBackend {
             data_models: &[DataModel::KeyValue, DataModel::Documents],
             ordered_ranges: false,
             transactions: false,
+            multiple_data_dirs: false,
             batch_read: BatchMode::Pipelined,
             batch_insert: BatchMode::Pipelined,
             batch_update: BatchMode::Pipelined,

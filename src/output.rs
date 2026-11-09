@@ -4,6 +4,7 @@ use std::{
     alloc::System,
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use serde::Serialize;
@@ -19,7 +20,10 @@ pub struct WorkloadReport {
     pub workload: String,
     pub status: String,
     pub elapsed_seconds: f64,
+    /// The flush after the phase; a load's throughput counts it.
     pub flush_seconds: f64,
+    /// The flush before the backend reopened for this phase, under `--between-runs reopen`.
+    pub reopen_flush_seconds: f64,
     pub calls: u64,
     pub entries: u64,
     pub throughput: f64,
@@ -49,6 +53,77 @@ pub struct MachineInfo {
     pub os: Option<String>,
     pub architecture: &'static str,
     pub disks: Vec<DiskInfo>,
+    pub budget: Budget,
+}
+
+/// The cores and memory every engine gets: this process's affinity mask and cgroup limit, which containers inherit.
+#[derive(Clone, Debug, Serialize)]
+pub struct Budget {
+    pub cores: usize,
+    /// The affinity mask as a cpuset list, like `0-15`, for `docker create --cpuset-cpus`.
+    pub cpus: String,
+    /// Bytes the engine may use, page cache included.
+    pub memory_limit: u64,
+}
+
+static BUDGET: OnceLock<Budget> = OnceLock::new();
+
+impl Budget {
+    /// The environment's budget, narrowed by `--memory-limit`, which may not exceed the cgroup's limit.
+    pub fn resolve(memory_limit: Option<u64>) -> Result<Self> {
+        let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let cpus = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .map_or_else(|| format!("0-{}", cores - 1), |list| list.trim().to_owned());
+        let environment = cgroup_memory_limit().unwrap_or_else(|| sysinfo::System::new_all().total_memory());
+        let memory_limit = match memory_limit {
+            Some(bytes) if bytes > environment => {
+                return Err(format!(
+                    "--memory-limit {bytes} exceeds the {environment} bytes this process may use"
+                ))
+            }
+            Some(bytes) => bytes,
+            None => environment,
+        };
+        Ok(Self {
+            cores,
+            cpus,
+            memory_limit,
+        })
+    }
+    /// Fixes the run's budget; later calls keep the first.
+    pub fn install(self) -> &'static Self {
+        BUDGET.get_or_init(|| self)
+    }
+}
+
+/// The run's budget, or the environment's when no run installed one, as in tests.
+pub fn budget() -> &'static Budget {
+    BUDGET.get_or_init(|| Budget::resolve(None).expect("the environment's budget needs no flag"))
+}
+
+/// The tightest `memory.max` from this process's cgroup up to the root, or `None` when none is set.
+fn cgroup_memory_limit() -> Option<u64> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut path = PathBuf::from("/sys/fs/cgroup");
+    path.push(
+        membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?
+            .trim_start_matches('/'),
+    );
+    path.ancestors()
+        .take_while(|directory| directory.starts_with("/sys/fs/cgroup"))
+        .filter_map(|directory| {
+            std::fs::read_to_string(directory.join("memory.max"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .min()
 }
 
 #[derive(Serialize)]
@@ -83,6 +158,7 @@ pub fn collect_machine_info() -> MachineInfo {
         os: sysinfo::System::long_os_version(),
         architecture: std::env::consts::ARCH,
         disks: collect_disks(),
+        budget: budget().clone(),
     }
 }
 

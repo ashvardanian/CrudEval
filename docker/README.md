@@ -33,5 +33,4 @@ docker build -f docker/garnet-json.Dockerfile -t crudeval-garnet-json:2.1.8 dock
 Valkey uses the bundle image with its native JSON module.
 `surrealdb.yml` starts SurrealDB 3.3.0 with SurrealKV and `sync=every`; its document and graph adapter requires `--durability flushed`.
 
-Dragonfly chooses its I/O thread count from the available CPUs by default.
-On memory-constrained hosts, use `--server dragonfly --dragonfly-threads 4`; the selected count is recorded in the report and dataset identity.
+Dragonfly chooses its I/O thread count from the CPUs in its container's cpuset, which the harness sets with the memory limit.

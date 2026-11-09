@@ -25,7 +25,7 @@ use crudeval::{
         Result, TransactionSession,
     },
     docker::{ContainerHandle, NetworkHandle, Startup},
-    run, BetweenWorkloads, CommonArgs,
+    run, BetweenRuns, CommonArgs,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -65,8 +65,8 @@ fn id(key_width: KeyWidth, key: Key) -> Bson {
     })
 }
 fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backend, System>> {
-    if args.between_workloads != BetweenWorkloads::Keep {
-        return Err("Docker backends support only --between-workloads keep".into());
+    if args.between_runs != BetweenRuns::Keep {
+        return Err("Docker backends support only --between-runs keep".into());
     }
 
     if args.data_model == DataModel::Graph {
@@ -157,14 +157,15 @@ fn open(args: &CommonArgs, path: &Path, server: Server) -> Result<Box<dyn Backen
             ..Startup::default()
         },
     )?;
+    let pool = args.threads[0].0.get();
     let uri = match server {
         Server::Mongodb => format!(
-            "mongodb://127.0.0.1:{}/?serverSelectionTimeoutMS=1000&journal={}",
+            "mongodb://127.0.0.1:{}/?serverSelectionTimeoutMS=1000&maxPoolSize={pool}&journal={}",
             container.port,
             args.durability == Durability::Flushed
         ),
         Server::Ferretdb => format!(
-            "mongodb://crudeval:crudeval@127.0.0.1:{}/?serverSelectionTimeoutMS=1000",
+            "mongodb://crudeval:crudeval@127.0.0.1:{}/?serverSelectionTimeoutMS=1000&maxPoolSize={pool}",
             container.port
         ),
     };
@@ -214,6 +215,7 @@ impl Backend for MongoDbBackend {
             data_models: &[DataModel::KeyValue, DataModel::Documents],
             ordered_ranges: true,
             transactions: false,
+            multiple_data_dirs: false,
             batch_read: BatchMode::Native,
             batch_insert: BatchMode::Native,
             batch_update: BatchMode::Native,

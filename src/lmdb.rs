@@ -24,16 +24,13 @@ use crudeval::{
         directory_bytes, Backend, BackendCapabilities, BackendSession, DataModel, Durability, Key, KeyWidth,
         KeysOutput, RecordInput, RecordOutput, Result, TransactionSession,
     },
-    run, CommonArgs,
+    output, run, CommonArgs,
 };
 
 #[derive(Parser)]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
-    /// Largest database the memory map can hold, like 1TB.
-    #[arg(long, env = "CRUDEVAL_MAP_SIZE", default_value = "1TB", value_parser = crudeval::workload::parse_size)]
-    map_size: crudeval::Bytes,
 }
 struct LmdbBackend {
     env: Env,
@@ -44,15 +41,24 @@ struct LmdbBackend {
     map_size: usize,
 }
 impl LmdbBackend {
-    fn open(path: &Path, durability: Durability, key_width: KeyWidth, map_size: usize) -> Result<Self> {
-        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
-        let mut options = EnvOpenOptions::new();
-        options.map_size(map_size).max_readers(4096);
+    fn open(path: &Path, durability: Durability, key_width: KeyWidth) -> Result<Self> {
         let flags = match durability {
             Durability::None => EnvFlags::NO_SYNC,
-            Durability::Buffered => EnvFlags::NO_META_SYNC,
+            Durability::Buffered => {
+                return Err(
+                    "LMDB has no log to buffer; NO_META_SYNC still syncs every commit, so use none or flushed".into(),
+                )
+            }
             Durability::Flushed => EnvFlags::empty(),
         };
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        // The map reserves address space, not memory, so it spans the disk holding the database.
+        let disks = output::collect_disks();
+        let disk = output::disk_of(&disks, path).ok_or("no disk holds the data directory")?;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let map_size = usize::try_from(disk.total_bytes / page * page).map_err(|_| "disk exceeds the address space")?;
+        let mut options = EnvOpenOptions::new();
+        options.map_size(map_size).max_readers(4096);
         // Each sweep owns an isolated path and keeps its environment alive for every session.
         let env = unsafe { options.flags(flags).open(path) }.map_err(|e| e.to_string())?;
         let mut transaction = env.write_txn().map_err(|e| e.to_string())?;
@@ -77,10 +83,10 @@ impl Backend for LmdbBackend {
             ("library_version".into(), json!(heed::lmdb_version().string)),
             (
                 "sync_mode".into(),
-                json!(match self.durability {
-                    Durability::None => "NO_SYNC",
-                    Durability::Buffered => "NO_META_SYNC",
-                    Durability::Flushed => "sync",
+                json!(if self.durability == Durability::None {
+                    "NO_SYNC"
+                } else {
+                    "sync"
                 }),
             ),
             ("durability".into(), json!(self.durability)),
@@ -255,26 +261,15 @@ impl TransactionSession for LmdbSession<'_> {
 
 fn main() -> Result<()> {
     let cli: Cli = crudeval::parse_cli();
-    let settings = [("Map size", cli.map_size.to_string())];
-    run(
-        cli.common,
-        json!({"map_size": cli.map_size}),
-        &settings,
-        move |args, path| {
-            if args.data_model != DataModel::KeyValue {
-                return Err("LMDB supports only kv data_model".into());
-            }
-            Ok(Box::new_in(
-                LmdbBackend::open(
-                    path,
-                    args.durability,
-                    args.key_width()?,
-                    usize::try_from(cli.map_size.0).map_err(|_| "map size exceeds platform limit")?,
-                )?,
-                System,
-            ))
-        },
-    )
+    run(cli.common, json!({}), &[], move |args, path| {
+        if args.data_model != DataModel::KeyValue {
+            return Err("LMDB supports only kv data_model".into());
+        }
+        Ok(Box::new_in(
+            LmdbBackend::open(path, args.durability, args.key_width()?)?,
+            System,
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -285,7 +280,7 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = LmdbBackend::open(path, Durability::None, KeyWidth::U64, 64 << 20).unwrap();
+        let db = LmdbBackend::open(path, Durability::None, KeyWidth::U64).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
 }

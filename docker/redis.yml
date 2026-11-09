@@ -26,7 +26,7 @@ services:
       dockerfile: garnet-json.Dockerfile
     profiles: [garnet]
     ports: ["127.0.0.1::6379"]
-    command: ["--lua", "--lua-transaction-mode", "--loadmodulecs", "/app/modules/GarnetJSON.dll", "--extension-bin-paths", "/app/modules", "--bind", "0.0.0.0", "--port", "6379", "--storage-tier", "--recover", "--logdir", "/data/log", "--checkpointdir", "/data/checkpoint", "--memory", "256m", "--index", "64m"]
+    command: ["--lua", "--lua-transaction-mode", "--loadmodulecs", "/app/modules/GarnetJSON.dll", "--extension-bin-paths", "/app/modules", "--bind", "0.0.0.0", "--port", "6379", "--storage-tier", "--recover", "--logdir", "/data/log", "--checkpointdir", "/data/checkpoint"]
   kvrocks:
     image: apache/kvrocks:2.17.0
     profiles: [kvrocks]

@@ -27,16 +27,13 @@ use crudeval::{
         DocumentPatch, DocumentRef, DocumentSession, Durability, Key, KeyWidth, KeysOutput, RecordInput, RecordOutput,
         Result, TransactionSession,
     },
-    run, Bytes, CommonArgs,
+    run, CommonArgs,
 };
 
 #[derive(Parser)]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
-    /// Page cache per session, like 64MB.
-    #[arg(long, env = "CRUDEVAL_CACHE_SIZE", default_value = "64MB", value_parser = crudeval::workload::parse_size)]
-    cache_size: Bytes,
 }
 
 struct SqliteBackend {
@@ -44,7 +41,6 @@ struct SqliteBackend {
     durability: Durability,
     key_width: KeyWidth,
     docs: bool,
-    cache_size: u64,
     keeper: Mutex<Connection>,
 }
 struct SqliteSession {
@@ -69,12 +65,14 @@ impl SqliteBackend {
                 },
             )
             .map_err(|e| e.to_string())?;
-        connection
-            .pragma_update(None, "cache_size", -((self.cache_size >> 10) as i64))
-            .map_err(|e| e.to_string())?;
         Ok(connection)
     }
-    fn open(path: &Path, durability: Durability, key_width: KeyWidth, docs: bool, cache_size: u64) -> Result<Self> {
+    /// Each connection's shipped page cache as SQLite reports it: pages when positive, KiB when negative.
+    fn cache_size(&self) -> Option<i64> {
+        let connection = self.keeper.lock().ok()?;
+        connection.pragma_query_value(None, "cache_size", |row| row.get(0)).ok()
+    }
+    fn open(path: &Path, durability: Durability, key_width: KeyWidth, docs: bool) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let path = path.join("sqlite.db");
         let keeper = Connection::open(&path).map_err(|e| e.to_string())?;
@@ -87,7 +85,6 @@ impl SqliteBackend {
             durability,
             key_width,
             docs,
-            cache_size,
             keeper: Mutex::new(keeper),
         })
     }
@@ -112,7 +109,7 @@ impl Backend for SqliteBackend {
                 "document_storage".into(),
                 json!(if self.docs { "JSONB" } else { "none" }),
             ),
-            ("cache_size_per_session".into(), json!(self.cache_size)),
+            ("cache_size".into(), json!(self.cache_size())),
         ]);
         metadata
     }
@@ -417,27 +414,20 @@ impl DocumentSession for SqliteSession {
 
 fn main() -> Result<()> {
     let cli: Cli = crudeval::parse_cli();
-    let settings = [("Cache size", cli.cache_size.to_string())];
-    run(
-        cli.common,
-        json!({"cache_size": cli.cache_size}),
-        &settings,
-        move |args, path| {
-            if args.data_model == DataModel::Graph {
-                return Err("SQLite graph data_model is unsupported".into());
-            }
-            Ok(Box::new_in(
-                SqliteBackend::open(
-                    path,
-                    args.durability,
-                    args.key_width()?,
-                    args.data_model == DataModel::Documents,
-                    cli.cache_size.0,
-                )?,
-                System,
-            ))
-        },
-    )
+    run(cli.common, json!({}), &[], move |args, path| {
+        if args.data_model == DataModel::Graph {
+            return Err("SQLite graph data_model is unsupported".into());
+        }
+        Ok(Box::new_in(
+            SqliteBackend::open(
+                path,
+                args.durability,
+                args.key_width()?,
+                args.data_model == DataModel::Documents,
+            )?,
+            System,
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -448,14 +438,14 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = SqliteBackend::open(path, Durability::None, KeyWidth::U64, false, 8).unwrap();
+        let db = SqliteBackend::open(path, Durability::None, KeyWidth::U64, false).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
 
     #[test]
     fn document_update_and_rollback() {
         let directory = tempfile::tempdir().unwrap();
-        let db = SqliteBackend::open(directory.path(), Durability::Flushed, KeyWidth::U64, true, 8).unwrap();
+        let db = SqliteBackend::open(directory.path(), Durability::Flushed, KeyWidth::U64, true).unwrap();
         let mut session = db.session().unwrap();
         let session = session.documents().unwrap();
         let key = Key::from_u128(1);

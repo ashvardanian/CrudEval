@@ -29,7 +29,7 @@ use crudeval::{
         DocumentOutput, DocumentPatch, DocumentRef, DocumentSession, Durability, GraphEdge, GraphInput, GraphOutput,
         GraphPatch, GraphSession, Key, KeysOutput, RecordInput, RecordOutput, Result, TransactionSession, VertexRef,
     },
-    run, CommonArgs,
+    output, run, CommonArgs,
 };
 
 /// Deltas a transaction may buffer, the engine's ceiling; only a transaction's bytes are taken up front.
@@ -42,9 +42,6 @@ struct Cli {
     /// UStore engine: nvme, or ram, which keeps its image in the data directory.
     #[arg(long, env = "CRUDEVAL_ENGINE", default_value = "nvme", value_parser = |text: &str| text.parse::<Engine>())]
     engine: Engine,
-    /// Executor threads of each worker, 0 to split the cores between the workers.
-    #[arg(long, env = "CRUDEVAL_EXECUTOR_THREADS", default_value = "0")]
-    executor_threads: usize,
 }
 
 fn to_store(key: &Key) -> ustore::Key {
@@ -129,25 +126,21 @@ impl UStoreBackend {
         data_model: DataModel,
         durability: Durability,
         workers: usize,
-        executor_threads: usize,
     ) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let directory = path.to_str().ok_or("data directory is not UTF-8")?;
-        let executor_threads = match executor_threads {
-            0 => {
-                let cores = std::thread::available_parallelism().map_err(|e| e.to_string())?.get();
-                (cores * 7 / 8 / workers).max(1)
-            }
-            threads => threads,
-        };
+        let budget = output::budget();
+        // The workers split the cores, as RocksDB's background jobs get all of them; with O_DIRECT reads the engine
+        // has no page cache to lean on, so its own memory takes the whole limit.
+        let executor_threads = (budget.cores / workers).max(1);
         // Threads outside the opening executor share these channels, so every worker's thread gets one.
         let io = IOOptions {
-            shared_io_channels: workers * executor_threads,
+            shared_io_channels: workers,
             ..IOOptions::default()
         };
         let (database, executor) = match engine {
             Engine::NVME => {
-                let executor = Executor::for_nvme(1, &io, 0).map_err(|e| e.to_string())?;
+                let executor = Executor::for_nvme(1, &io).map_err(|e| e.to_string())?;
                 let manifest = format!("{directory}/crudeval.ustore.json");
                 let mut data_directories = Vec::with_capacity(further.len());
                 for directory in further {
@@ -160,12 +153,13 @@ impl UStoreBackend {
                     data_directories: &data_directories,
                     executor: Some(&executor),
                     transaction_max_deltas: TRANSACTION_MAX_DELTAS,
+                    memory_limit: budget.memory_limit,
                     ..NVMEOptions::at(&manifest)
                 };
                 (Database::open_nvme(&options).map_err(|e| e.to_string())?, executor)
             }
             Engine::RAM => {
-                let executor = Executor::for_ram(&[], 1, 0).map_err(|e| e.to_string())?;
+                let executor = Executor::for_ram(&[], 1).map_err(|e| e.to_string())?;
                 let options = RAMOptions {
                     executor: Some(&executor),
                     ..RAMOptions::default()
@@ -217,6 +211,10 @@ impl Backend for UStoreBackend {
             ("library_version".into(), json!(ustore::version())),
             ("engine".into(), json!(self.engine.to_string())),
             ("executor_threads".into(), json!(self.executor_threads)),
+            (
+                "memory_limit".into(),
+                json!(matches!(self.engine, Engine::NVME).then(|| output::budget().memory_limit)),
+            ),
             ("data_directories".into(), json!(1 + self.further.len())),
             ("durability".into(), json!(self.durability)),
             ("write_durability".into(), json!(self.writes.to_string())),
@@ -244,8 +242,8 @@ impl Backend for UStoreBackend {
     }
     fn session(&self) -> Result<Box<dyn BackendSession + '_, System>> {
         let executor = match self.engine {
-            Engine::NVME => Executor::for_nvme(self.executor_threads, &IOOptions::default(), 0),
-            _ => Executor::for_ram(&[], self.executor_threads, 0),
+            Engine::NVME => Executor::for_nvme(self.executor_threads, &IOOptions::default()),
+            _ => Executor::for_ram(&[], self.executor_threads),
         }
         .map_err(|e| e.to_string())?;
         let arena = || Arena::new_in(&executor).map_err(|e| e.to_string());
@@ -774,13 +772,10 @@ impl GraphSession for UStoreSession<'_> {
 
 fn main() -> Result<()> {
     let cli: Cli = crudeval::parse_cli();
-    let settings = [
-        ("Engine", cli.engine.to_string()),
-        ("Executor threads", cli.executor_threads.to_string()),
-    ];
+    let settings = [("Engine", cli.engine.to_string())];
     run(
         cli.common,
-        json!({"engine": cli.engine.to_string(), "executor_threads": cli.executor_threads}),
+        json!({"engine": cli.engine.to_string()}),
         &settings,
         move |args, path| {
             Ok(Box::new_in(
@@ -791,7 +786,6 @@ fn main() -> Result<()> {
                     args.data_model,
                     args.durability,
                     args.threads[0].0.get(),
-                    cli.executor_threads,
                 )?,
                 System,
             ))
@@ -804,7 +798,7 @@ mod tests {
     use super::*;
 
     fn opened(engine: Engine, data_model: DataModel, directory: &tempfile::TempDir) -> UStoreBackend {
-        UStoreBackend::open(directory.path(), &[], engine, data_model, Durability::None, 1, 2).unwrap()
+        UStoreBackend::open(directory.path(), &[], engine, data_model, Durability::None, 1).unwrap()
     }
 
     #[test]
@@ -826,7 +820,6 @@ mod tests {
             DataModel::KeyValue,
             Durability::None,
             1,
-            2,
         )
         .unwrap();
         crudeval::assert_backend_contract!(&backend);

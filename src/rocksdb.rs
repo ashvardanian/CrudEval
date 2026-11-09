@@ -25,16 +25,13 @@ use crudeval::{
         directory_bytes, Backend, BackendCapabilities, BackendSession, BatchMode, DataModel, Durability, Key, KeyWidth,
         KeysOutput, RecordInput, RecordOutput, Result, TransactionSession,
     },
-    output, run, Bytes, CommonArgs,
+    output, run, CommonArgs,
 };
 
 #[derive(Parser)]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
-    /// Memtable size before a flush, like 128MB.
-    #[arg(long, env = "CRUDEVAL_WRITE_BUFFER_SIZE", default_value = "128MB", value_parser = crudeval::workload::parse_size)]
-    write_buffer_size: Bytes,
 }
 struct RocksDbBackend {
     db: DB,
@@ -43,25 +40,19 @@ struct RocksDbBackend {
     /// Every `db_paths` entry with its target size, or none when the database keeps to `path`.
     db_paths: Vec<(PathBuf, u64)>,
     durability: Durability,
-    write_buffer_size: usize,
+    background_jobs: usize,
     write_options: WriteOptions,
     sst_id: AtomicU64,
     ingested: AtomicBool,
 }
 impl RocksDbBackend {
-    fn open(
-        path: &Path,
-        further: &[PathBuf],
-        durability: Durability,
-        key_width: KeyWidth,
-        write_buffer_size: usize,
-    ) -> Result<Self> {
-        if write_buffer_size == 0 {
-            return Err("write buffer size must be positive".into());
-        }
+    fn open(path: &Path, further: &[PathBuf], durability: Durability, key_width: KeyWidth) -> Result<Self> {
+        // RocksDB ships 2 background jobs whatever the machine; it splits however many it gets between flushes
+        // and compactions itself, while its caches stay as shipped and the page cache works inside the cgroup.
+        let background_jobs = output::budget().cores;
         let mut options = Options::default();
         options.create_if_missing(true);
-        options.set_write_buffer_size(write_buffer_size);
+        options.increase_parallelism(background_jobs as i32);
         let mut db_paths = Vec::new();
         if !further.is_empty() {
             let disks = output::collect_disks();
@@ -90,7 +81,7 @@ impl RocksDbBackend {
             path: path.into(),
             db_paths,
             durability,
-            write_buffer_size,
+            background_jobs,
             sst_id: AtomicU64::new(0),
             ingested: AtomicBool::new(false),
         })
@@ -105,7 +96,7 @@ impl Backend for RocksDbBackend {
             ("library_version".into(), json!("11.8.1")),
             ("compact_after_ingestion".into(), json!(true)),
             ("durability".into(), json!(self.durability)),
-            ("write_buffer_size".into(), json!(self.write_buffer_size)),
+            ("background_jobs".into(), json!(self.background_jobs)),
             ("conditional_writes".into(), json!("disjoint_deletes")),
             (
                 "data_layout".into(),
@@ -158,6 +149,18 @@ impl Backend for RocksDbBackend {
 }
 struct RocksDbSession<'a>(&'a RocksDbBackend);
 impl TransactionSession for RocksDbSession<'_> {}
+
+impl RocksDbSession<'_> {
+    /// Which keys exist, in one batched lookup, so updates and deletes count only live records.
+    fn present(&self, keys: &[Key]) -> Result<Vec<bool>> {
+        self.0
+            .db
+            .multi_get(keys.iter().map(|key| self.0.key_width.bytes(key)))
+            .into_iter()
+            .map(|value| value.map(|value| value.is_some()).map_err(|e| e.to_string()))
+            .collect()
+    }
+}
 
 impl BackendSession for RocksDbSession<'_> {
     fn insert(&mut self, keys: &[Key], values: &RecordInput<'_>) -> Result<usize> {
@@ -224,14 +227,8 @@ impl BackendSession for RocksDbSession<'_> {
         }
         let mut batch = WriteBatch::default();
         let mut count = 0;
-        for (i, key) in keys.iter().enumerate() {
-            if self
-                .0
-                .db
-                .get_pinned(self.0.key_width.bytes(key))
-                .map_err(|e| e.to_string())?
-                .is_some()
-            {
+        for (i, (key, present)) in keys.iter().zip(self.present(keys)?).enumerate() {
+            if present {
                 batch.put(self.0.key_width.bytes(key), values.get(i).ok_or("missing input value")?);
                 count += 1;
             }
@@ -261,14 +258,8 @@ impl BackendSession for RocksDbSession<'_> {
         }
         let mut batch = WriteBatch::default();
         let mut count = 0;
-        for key in keys {
-            if self
-                .0
-                .db
-                .get_pinned(self.0.key_width.bytes(key))
-                .map_err(|e| e.to_string())?
-                .is_some()
-            {
+        for (key, present) in keys.iter().zip(self.present(keys)?) {
+            if present {
                 batch.delete(self.0.key_width.bytes(key));
                 count += 1;
             }
@@ -339,26 +330,15 @@ impl BackendSession for RocksDbSession<'_> {
 }
 fn main() -> Result<()> {
     let cli: Cli = crudeval::parse_cli();
-    run(
-        cli.common,
-        json!({"write_buffer_size": cli.write_buffer_size}),
-        &[("Write buffer size", cli.write_buffer_size.to_string())],
-        move |args, path| {
-            if args.data_model != DataModel::KeyValue {
-                return Err("RocksDB supports only kv data_model".into());
-            }
-            Ok(Box::new_in(
-                RocksDbBackend::open(
-                    path,
-                    &args.further_data_dirs(path),
-                    args.durability,
-                    args.key_width()?,
-                    usize::try_from(cli.write_buffer_size.0).map_err(|_| "write buffer size exceeds platform limit")?,
-                )?,
-                System,
-            ))
-        },
-    )
+    run(cli.common, json!({}), &[], move |args, path| {
+        if args.data_model != DataModel::KeyValue {
+            return Err("RocksDB supports only kv data_model".into());
+        }
+        Ok(Box::new_in(
+            RocksDbBackend::open(path, &args.further_data_dirs(path), args.durability, args.key_width()?)?,
+            System,
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -369,7 +349,7 @@ mod tests {
     fn embedded_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
-        let db = RocksDbBackend::open(path, &[], Durability::None, KeyWidth::U64, 8 << 20).unwrap();
+        let db = RocksDbBackend::open(path, &[], Durability::None, KeyWidth::U64).unwrap();
         crudeval::assert_backend_contract!(&db);
     }
 
@@ -378,7 +358,7 @@ mod tests {
         use crudeval::backend::RecordBatch;
 
         let directory = tempfile::tempdir().unwrap();
-        let db = RocksDbBackend::open(directory.path(), &[], Durability::None, KeyWidth::U128, 8 << 20).unwrap();
+        let db = RocksDbBackend::open(directory.path(), &[], Durability::None, KeyWidth::U128).unwrap();
         let keys = [Key::from_u128(9 << 64), Key::from_u128(3), Key::from_u128(5 << 32)];
         let mut values = RecordBatch::new(3, 64);
         {
@@ -395,18 +375,42 @@ mod tests {
         assert_eq!(output.as_input().get(1), Some(b"tri_".as_slice()));
     }
 
+    /// Runs itself in a 2-core, 512 MiB scope and reads the background jobs RocksDB applied back from OPTIONS.
+    #[test]
+    #[ignore = "spawns systemd-run --user"]
+    fn budget_reaches_options() {
+        if std::env::var_os("CRUDEVAL_BUDGET_SCOPE").is_none() {
+            let status = std::process::Command::new("systemd-run")
+                .args(["--user", "--scope", "--quiet", "--collect"])
+                .arg(format!("--unit=crudeval-budget-{}", std::process::id()))
+                .args(["-p", "MemoryMax=512M", "-p", "MemorySwapMax=0", "taskset", "-c", "0-1"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::budget_reaches_options", "--include-ignored"])
+                .env("CRUDEVAL_BUDGET_SCOPE", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let budget = output::budget();
+        assert_eq!((budget.cores, budget.memory_limit), (2, 512 << 20));
+        let directory = tempfile::tempdir().unwrap();
+        RocksDbBackend::open(directory.path(), &[], Durability::None, KeyWidth::U64).unwrap();
+        let options = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("OPTIONS-"))
+            .max()
+            .unwrap();
+        let text = std::fs::read_to_string(options).unwrap();
+        assert!(text.lines().any(|line| line.trim() == "max_background_jobs=2"));
+    }
+
     #[test]
     fn db_paths_contract() {
         let directories = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
         let further = [directories[1].path().to_path_buf()];
-        let db = RocksDbBackend::open(
-            directories[0].path(),
-            &further,
-            Durability::None,
-            KeyWidth::U64,
-            8 << 20,
-        )
-        .unwrap();
+        let db = RocksDbBackend::open(directories[0].path(), &further, Durability::None, KeyWidth::U64).unwrap();
         assert_eq!(db.db_paths.len(), 2);
         assert!(db.db_paths.iter().all(|&(_, bytes)| bytes > 0));
         crudeval::assert_backend_contract!(&db);

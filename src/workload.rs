@@ -13,7 +13,7 @@ use crate::{
 const MIN_VALUE_SIZE: Bytes = Bytes(24);
 
 pub const DEFAULT_WORKLOADS: &str = "bulk-load,read,batch-read-256,range-read-256,full-scan,read-50-update-50,read-latest-95-insert-5,batch-insert-1000,delete-oldest";
-const EXPECTED_WORKLOADS: &str = "expected comma-separated workloads: bulk-load, read, full-scan, read-50-update-50, read-95-update-5, read-latest-95-insert-5, range-read-95-insert-5, read-50-read-modify-write-50, delete-oldest, batch-read-N, range-read-N, batch-insert-N or bulk-load-N";
+const EXPECTED_WORKLOADS: &str = "expected comma-separated workloads: bulk-load, read, full-scan, read-50-update-50, read-95-update-5, read-latest-95-insert-5, range-read-95-insert-5, read-50-read-modify-write-50, delete-oldest, ingest, batch-read-N, range-read-N, batch-insert-N, bulk-load-N or ingest-N";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -25,6 +25,8 @@ pub enum Operation {
     RangeRead,
     ReadModifyWrite,
     BulkLoad,
+    /// The engine's native bulk path, such as sorted-file ingestion; `BulkLoad` writes through ordinary batches.
+    Ingest,
     FullScan,
 }
 
@@ -38,8 +40,13 @@ impl Operation {
             Self::RangeRead => "range-read",
             Self::ReadModifyWrite => "read-modify-write",
             Self::BulkLoad => "bulk-load",
+            Self::Ingest => "ingest",
             Self::FullScan => "full-scan",
         }
+    }
+    /// Whether the operation loads reserved key ranges, through batches or the native bulk path.
+    pub fn loads(self) -> bool {
+        matches!(self, Self::BulkLoad | Self::Ingest)
     }
 }
 
@@ -96,6 +103,10 @@ impl FromStr for Workload {
                 result.batch_size = 100_000;
                 vec![(BulkLoad, 100)]
             }
+            "ingest" => {
+                result.batch_size = 100_000;
+                vec![(Ingest, 100)]
+            }
             "read" => vec![(Read, 100)],
             "full-scan" => {
                 result.batch_size = 256;
@@ -119,6 +130,7 @@ impl FromStr for Workload {
                     ("range-read-", RangeRead),
                     ("batch-insert-", Insert),
                     ("bulk-load-", BulkLoad),
+                    ("ingest-", Ingest),
                 ]
                 .into_iter()
                 .find_map(|(prefix, operation)| name.strip_prefix(prefix).map(|n| (prefix, n, operation)))
