@@ -12,6 +12,7 @@
 
 set -u
 export LC_ALL=C # Byte-wise regexes, immune to the committer's locale
+unset FORCE_COLOR CLICOLOR_FORCE # Plain tool output, since the checks parse it by its colons
 
 rejection_count=0
 
@@ -26,6 +27,9 @@ ruff_lint_options="--target-version py311 --extend-select I"
 
 
 # region Shared Helpers
+
+# mawk runs these programs fastest, then gawk; each program keeps to what gawk, mawk and BWK awk accept.
+fastest_awk=$(command -v mawk || command -v gawk || echo awk)
 
 # Prints the reason and the first offending lines. Counts rather than latches, because the selftest
 # asserts that a bad fixture trips exactly one rule.
@@ -53,6 +57,7 @@ comment_structure_awk='
     function is_empty_comment_line(line) { return line ~ /^[[:space:]]*\*[[:space:]]*$/ }
     function without_code_spans(text,    start, length_) {
         gsub(/`[^`]*`/, "C", text)
+        gsub(/<\/tt>/, "\001", text); gsub(/<tt>[^\001]*\001/, "C", text)
         while ((start = index(text, "<code")) && (length_ = index(substr(text, start), "</code>")))
             text = substr(text, 1, start - 1) "C" substr(text, start + length_ + 6)
         return text
@@ -63,8 +68,10 @@ comment_structure_awk='
 # word would still fit under the paragraph's own measure: its widest other line, capped at 100. The caller
 # defines `characters(text)`.
 paragraph_room_awk='
-    function first_word(text) {
+    function first_word(text,    end_) {
+        if (match(text, /^@(a|b|c|e|p|ref)[[:space:]]+[^[:space:]]+/)) return substr(text, 1, RLENGTH)
         if (text ~ /^`[^`]*`/) { match(text, /^`[^`]*`[^[:space:]]*/); return substr(text, 1, RLENGTH) }
+        if (text ~ /^<tt>/ && (end_ = index(text, "</tt>"))) { match(substr(text, end_ + 5), /^[^[:space:]]*/); return substr(text, 1, end_ + 4 + RLENGTH) }
         sub(/[[:space:]].*$/, "", text); return text
     }
     function hold_paragraph_line(line, body, width) { ++held; held_line[held] = line; held_body[held] = body; held_width[held] = width }
@@ -83,38 +90,52 @@ paragraph_room_awk='
 '
 
 # Runs an awk program over the staged file with `added[line]` preloaded, so a structural check sees the
-# whole file as context and still reports only what this commit added.
-scan_staged_file_marking_added_lines() { # scan_staged_file_marking_added_lines <awk-program>
-    awk "$comment_structure_awk"'NR == FNR { added[$1 + 0]; next } '"$1" "$staged_lines_path" "$staged_text_path"
+# whole file as context and still reports only what this commit added; code checks use the comment-free copy.
+scan_staged_file_marking_added_lines() { # scan_staged_file_marking_added_lines <awk-program> [source]
+    "$fastest_awk" "$comment_structure_awk"'FILENAME == ARGV[1] { added[$1 + 0]; next } '"$1" "$staged_lines_path" "${2:-$staged_text_path}"
 }
 
 # Blanks C-family comments to spaces, keeping every line and column in place, so a code check never fires
-# on a comment that merely names the construct it bans. String and character literals pass through.
-blank_c_comments_preserving_columns() { # blank_c_comments_preserving_columns < source
-    awk '
+# on a comment that merely names the construct it bans. String, character and raw string literals pass
+# through; with `literals`, their contents blank instead and comments pass through, so prose checks skip data.
+blank_c_comments_preserving_columns() { # blank_c_comments_preserving_columns [literals] < source
+    "$fastest_awk" -v blanked="${1:-comments}" '
+        function emit(span, kind) { if (kind == blanked) gsub(/./, " ", span); output = output span }
         {
             output = ""
             for (position = 1; position <= length($0); ++position) {
                 character = substr($0, position, 1)
                 pair = substr($0, position, 2)
+                if (state == "raw") {
+                    if (!(closing = index(substr($0, position), closer))) { emit(substr($0, position), "literals"); break }
+                    emit(substr($0, position, closing - 1), "literals"); output = output closer
+                    position += closing + length(closer) - 2; state = ""
+                    continue
+                }
                 if (state == "block") {
-                    if (pair == "*/") { state = ""; output = output "  "; ++position }
-                    else output = output " "
+                    if (!(closing = index(substr($0, position), "*/"))) { emit(substr($0, position), "comments"); break }
+                    emit(substr($0, position, closing + 1), "comments"); position += closing; state = ""
                     continue
                 }
                 if (state == "string" || state == "character") {
-                    output = output character
-                    if (character == "\\") { output = output substr($0, position + 1, 1); ++position }
-                    else if ((state == "string" && character == "\"") || (state == "character" && character == "\047")) state = ""
+                    if (character == "\\") { emit(substr($0, position, 2), "literals"); ++position }
+                    else if ((state == "string" && character == "\"") || (state == "character" && character == "\047")) { state = ""; output = output character }
+                    else emit(character, "literals")
                     continue
                 }
-                if (pair == "//") { tail = substr($0, position); gsub(/./, " ", tail); output = output tail; break }
-                if (pair == "/*") { state = "block"; output = output "  "; ++position; continue }
+                if (pair == "//") { emit(substr($0, position), "comments"); break }
+                if (pair == "/*") { state = "block"; emit(pair, "comments"); ++position; continue }
+                if (character == "\"" && substr($0, 1, position - 1) ~ /(^|[^A-Za-z0-9_])(u8|[uUL])?R$/ &&
+                    match(substr($0, position + 1), /^[^()\\[:space:]]*\(/)) {
+                    closer = ")" substr($0, position + 1, RLENGTH - 1) "\""
+                    output = output substr($0, position, RLENGTH + 1); position += RLENGTH; state = "raw"
+                    continue
+                }
                 if (character == "\"") state = "string"
                 else if (character == "\047") state = "character"
                 output = output character
             }
-            if (state != "block") state = ""
+            if (state != "block" && state != "raw") state = ""
             print output
         }'
 }
@@ -123,8 +144,8 @@ blank_c_comments_preserving_columns() { # blank_c_comments_preserving_columns < 
 # mode judges the documentation around code, not the working notes inside it.
 lines_outside_function_bodies() {
     case "$staged_path" in
-    *.h | *.hpp | *.c | *.cpp | *.cc | *.cu | *.cuh | *.rs | *.pml)
-        printf '%s\n' "$staged_file_text" | blank_c_comments_preserving_columns | awk '
+    *.h | *.hpp | *.c | *.cpp | *.cc | *.cu | *.cuh | *.hip | *.metal | *.pml | *.rs | *.go | *.swift | *.ts | *.mts | *.js | *.mjs | *.cjs)
+        printf '%s\n' "$staged_file_text" | blank_c_comments_preserving_columns | "$fastest_awk" '
             {
                 text = $0
                 gsub(/"(\\.|[^"\\])*"/, "\"\"", text); gsub(/\047(\\.|[^\047\\])\047/, "\047\047", text)
@@ -155,7 +176,21 @@ lines_outside_function_bodies() {
                 if (!(inside_at_start && body_depth > 0)) print NR
             }'
         ;;
-    *) printf '%s\n' "$staged_file_text" | awk '{ print NR }' ;;
+    *.py | *.pyi)
+        printf '%s\n' "$staged_file_text" | "$fastest_awk" '
+            {
+                indent = match($0, /[^[:space:]]/) - 1; blank = (indent < 0)
+                if (!blank && !awaiting_colon) while (open_defs > 0 && indent <= def_indent[open_defs]) --open_defs
+                inside = (open_defs > 0 && !awaiting_colon && (blank || indent > def_indent[open_defs]))
+                if (awaiting_colon) { if ($0 ~ /:[[:space:]]*(#.*)?$/) { def_indent[++open_defs] = awaiting_indent; awaiting_colon = 0 } print NR; next }
+                if ($0 ~ /^[[:space:]]*(async[[:space:]]+)?def[[:space:]]/) {
+                    inside = 0; awaiting_indent = indent
+                    if ($0 ~ /:[[:space:]]*(#.*)?$/) def_indent[++open_defs] = indent; else awaiting_colon = 1
+                }
+                if (!inside) print NR
+            }'
+        ;;
+    *) printf '%s\n' "$staged_file_text" | "$fastest_awk" '{ print NR }' ;;
     esac
 }
 
@@ -174,7 +209,7 @@ lines_outside_function_bodies() {
 check_ascii_arrows() {
     local arrows comment_opener
     case "$staged_path" in
-    *.mojo) comment_opener='#' ;;
+    *.py | *.pyi | *.mojo) comment_opener='#' ;;
     *.md) comment_opener='^[[:space:]]*#|^[[:space:]]*\*([[:space:]]|$)' ;;
     *) comment_opener='\/\/|\/\*|^[[:space:]]*\*([[:space:]]|$)' ;;
     esac
@@ -184,7 +219,7 @@ check_ascii_arrows() {
         /@(code|verbatim)/ { inside_code = 1 }
         /@end(code|verbatim)/ { inside_code = 0; next }
         !inside_fence && !inside_code && (FNR in added) {
-            prose = without_code_spans($0); gsub(/"(\\.|[^"\\])*"/, "\"\"", prose)
+            prose = without_code_spans($0); gsub(/"(\\.|[^"\\])*"/, "\"\"", prose); gsub(/@c[[:space:]]+[^[:space:]]+/, "C", prose)
             if (prose ~ /(('"$comment_opener"').*(<->|->|<-([^-]|$)))/) printf "line %d: %s\n", FNR, $0
         }')
     [ -z "$arrows" ] || reject_with_reason "$arrows" \
@@ -209,9 +244,10 @@ check_unicode_arrows_spaced() {
 }
 
 # Rejects a comment line that is only a `Usage:`, `Commands:` or `Example usage:` label, because a sentence
-# introduces a code block and the block names its language.
+# introduces a code block and the block names its language. Python sections and Go, checked apart, are exempt.
 check_usage_label_absent() {
     local labels
+    case "$staged_path" in *.py | *.pyi | *.go) return 0 ;; esac
     labels=$(printf '%s\n' "$staged_added_text" |
         grep -nE '^\+[[:space:]]*(\*|//[/!]?|#)[[:space:]]*(Usage|Commands|Example usage|Examples?|Invocation|Or locally|Run)( [a-z]+)?:[[:space:]]*$' || true)
     [ -z "$labels" ] || reject_with_reason "$labels" \
@@ -260,7 +296,7 @@ check_proper_names_capitalized() {
 # fires, so touching a line never forces a rename the commit is not about.
 check_abbreviations_spelled_out() {
     local abbreviated
-    abbreviated=$(awk -v abbreviations="$abbreviations_refused" '
+    abbreviated=$("$fastest_awk" -v abbreviations="$abbreviations_refused" '
         BEGIN { count = split(abbreviations, words, " "); for (word = 1; word <= count; ++word) banned[words[word]] = 1 }
         function has_banned_segment(token,    segments, total, segment) {
             total = split(token, segments, "_")
@@ -298,20 +334,29 @@ check_abbreviations_spelled_out() {
 
 # region Formatters
 
-# Rejects rustfmt drift across the crate, because `rustfmt.toml` is the law; `rustfmt_command` names the
-# toolchain that understands it, and the check skips without that toolchain or a crate.
+# Rejects rustfmt drift in the Rust files as staged, not as they sit in the working tree, because `rustfmt.toml`
+# is the law; `rustfmt_command` names the toolchain that understands it, as in `cargo +nightly fmt`, and the
+# check skips without that toolchain or a crate.
 check_rustfmt_clean() {
-    [ -f Cargo.toml ] && command -v cargo > /dev/null 2>&1 && $rustfmt_command --version > /dev/null 2>&1 || return 0
-    git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -q . || return 0
-    $rustfmt_command --check > /dev/null 2>&1 && return 0
-    reject_with_reason "" "staged Rust changes are not rustfmt clean;" "            run: $rustfmt_command"
+    local toolchain=${rustfmt_command#cargo }
+    toolchain=${toolchain%fmt}
+    [ -f Cargo.toml ] && rustfmt $toolchain --version > /dev/null 2>&1 || return 0
+    local edition staged_rust_path drifted=""
+    edition=$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml)
+    for staged_rust_path in $(git diff --cached --name-only --find-renames --diff-filter=ACMR -- '*.rs'); do
+        # Reading stdin, `--check` prints its diff yet exits 0, so the diff itself is the verdict.
+        [ -z "$(rustfmt $toolchain --edition "$edition" --config-path rustfmt.toml \
+            --check < "$results_directory/index/$staged_rust_path" 2> /dev/null)" ] || drifted="$drifted $staged_rust_path"
+    done
+    [ -z "$drifted" ] || reject_with_reason "" "staged Rust files are not rustfmt clean:$drifted;" \
+        "            run: $rustfmt_command"
 }
 
 # Rejects Rust imports out of the standard library, external crates, own crate order, or without a blank line
 # between those groups and after the last one, which rustfmt leaves alone. It reads the whole source from stdin.
 check_rust_use_groups() { # check_rust_use_groups <own-crate> <path> < source
     local findings
-    findings=$(awk -v own="$1" -v path="$2" -v quote="'" '
+    findings=$("$fastest_awk" -v own="$1" -v path="$2" -v quote="'" '
         BEGIN { literal = "r#*\"|\"|" quote "(\\\\.|[^" quote "\\\\])" quote "|//|/\\*" }
         function blanks(width) { return sprintf("%" width "s", "") }
         function count(text, bracket) { return gsub(bracket, "", text) }
@@ -393,7 +438,7 @@ check_ruff_format_on_added_lines() {
     command -v ruff > /dev/null 2>&1 || return 0
     local formatted drift
     formatted=$(ruff format --force-exclude --stdin-filename "$staged_path" - < "$staged_text_path" 2> /dev/null) || return 0
-    drift=$(diff -U0 "$staged_text_path" <(printf '%s\n' "$formatted") | awk '
+    drift=$(diff -U0 "$staged_text_path" <(printf '%s\n' "$formatted") | "$fastest_awk" '
         NR == FNR { added[$1 + 0]; next }
         /^@@/ {
             split($2, range, ",")
@@ -416,7 +461,7 @@ check_ruff_lint_on_added_lines() {
     local findings
     findings=$(ruff check $ruff_lint_options --quiet --force-exclude --output-format=concise --stdin-filename "$staged_path" - \
         < "$staged_text_path" 2> /dev/null |
-        awk -F: 'NR == FNR { added[$1 + 0]; next } ($2 + 0) in added || $4 == " invalid-syntax"' \
+        "$fastest_awk" -F: 'NR == FNR { added[$1 + 0]; next } ($2 + 0) in added || $4 == " invalid-syntax"' \
             "$staged_lines_path" -)
     [ -z "$findings" ] || reject_with_reason "$findings" \
         "$staged_path has ruff lint findings on its added lines; run: ruff check --fix $staged_path," \
@@ -428,7 +473,7 @@ check_taplo_clean() {
     command -v taplo > /dev/null 2>&1 && [ -f .taplo.toml ] || return 0
     local staged_toml_paths=()
     while IFS= read -r -d '' toml_path; do staged_toml_paths+=("$toml_path"); done \
-        < <(git diff --cached --name-only -z --diff-filter=ACM -- '*.toml')
+        < <(git diff --cached --name-only -z --find-renames --diff-filter=ACMR -- '*.toml')
     [ ${#staged_toml_paths[@]} -gt 0 ] || return 0
     taplo fmt --check "${staged_toml_paths[@]}" > /dev/null 2>&1 && return 0
     reject_with_reason "" "staged TOML is not taplo clean;" "            run: taplo fmt"
@@ -439,7 +484,7 @@ check_dprint_clean() {
     command -v dprint > /dev/null 2>&1 && [ -e .dprint.json ] || return 0
     local staged_json_yaml_paths=()
     while IFS= read -r -d '' json_yaml_path; do staged_json_yaml_paths+=("$json_yaml_path"); done \
-        < <(git diff --cached --name-only -z --diff-filter=ACM -- '*.json' '*.jsonc' '*.yml' '*.yaml')
+        < <(git diff --cached --name-only -z --find-renames --diff-filter=ACMR -- '*.json' '*.jsonc' '*.yml' '*.yaml')
     [ ${#staged_json_yaml_paths[@]} -gt 0 ] || return 0
     dprint check "${staged_json_yaml_paths[@]}" > /dev/null 2>&1 && return 0
     reject_with_reason "" "staged JSON or YAML is not dprint clean;" "            run: dprint fmt"
@@ -467,7 +512,7 @@ check_generated_artifacts() {
 check_workflow_names() {
     local nameless
     nameless=$(
-        printf '%s\n' "$staged_file_text" | awk '
+        printf '%s\n' "$staged_file_text" | "$fastest_awk" '
             # Jobs: two-space keys under the top-level `jobs:` section, named by a four-space `name:`.
             /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
             in_jobs && /^[^ #]/ { in_jobs = 0 }
@@ -510,7 +555,7 @@ check_banners() { # check_banners <path> < added-lines
     *) return 0 ;;
     esac
     local rulers
-    rulers=$(awk -v path="$1" -v quote="'" '
+    rulers=$("$fastest_awk" -v path="$1" -v quote="'" '
         BEGIN {
             stroke = "(─|━|┄|┅|┈|┉|╌|╍|═)"
             run = "(---+|===+|####+|////+|\\*\\*\\*+|" stroke stroke stroke "+)"
@@ -532,10 +577,10 @@ check_banners() { # check_banners <path> < added-lines
 }
 
 # Rejects two or more spaces after `.`, `!` or `?` before a capital, because prose uses one space between
-# sentences. Lines tagged `nk-nolint: spacing` are exempt.
+# sentences. Lines tagged `nk-nolint: spacing` and C-family literal contents, which are data, are exempt.
 check_single_space_between_sentences() {
     local doubled
-    doubled=$(printf '%s\n' "$staged_added_text" | grep -v 'nk-nolint: spacing' |
+    doubled=$(grep -v 'nk-nolint: spacing' "$staged_added_unquoted_path" |
         sed -E 's,^\+,,; s,^[[:space:]]*(//[/!]?|#|\*),,' |
         grep -nE '[.!?]  +[A-Z]' || true)
     [ -z "$doubled" ] || reject_with_reason "$doubled" \
@@ -593,7 +638,7 @@ check_markdownlint_clean() {
     [ -f .markdownlint-cli2.jsonc ] && npx --no-install markdownlint-cli2 --help > /dev/null 2>&1 || return 0
     local staged_markdown_paths=()
     while IFS= read -r -d '' markdown_path; do staged_markdown_paths+=("$markdown_path"); done \
-        < <(git diff --cached --name-only -z --diff-filter=ACM -- '*.md')
+        < <(git diff --cached --name-only -z --find-renames --diff-filter=ACMR -- '*.md')
     [ ${#staged_markdown_paths[@]} -gt 0 ] || return 0
     npx --no-install markdownlint-cli2 "${staged_markdown_paths[@]}" > /dev/null 2>&1 && return 0
     reject_with_reason "" "staged Markdown has markdownlint findings;" \
@@ -603,6 +648,14 @@ check_markdownlint_clean() {
 # endregion CrudEval Rules
 
 # region Dispatch Tables
+
+# Whether @p 1 is written in a language with C comments, which the comment blanking and the shared C checks read.
+speaks_c_comments() {
+    case "$1" in
+    *.c | *.h | *.hpp | *.cpp | *.cc | *.cu | *.cuh | *.hip | *.metal | *.pml) return 0 ;;
+    esac
+    return 1
+}
 
 # Routes one staged file through every prose and structure check its extension calls for.
 run_shared_checks() {
@@ -691,10 +744,10 @@ split_diff_by_path='
 read_staged_paths() {
     staged_paths=()
     while IFS= read -r -d '' staged_path; do staged_paths+=("$staged_path"); done \
-        < <(git diff --cached --name-only -z --diff-filter=ACM)
+        < <(git diff --cached --name-only -z --find-renames --diff-filter=ACMR)
     [ ${#staged_paths[@]} -eq 0 ] || printf '%s\0' "${staged_paths[@]}" |
         git checkout-index --prefix="$results_directory/index/" -z --stdin
-    git diff --cached --unified=0 --diff-filter=ACM | awk -v directory="$results_directory/" "$split_diff_by_path"
+    git diff --cached --unified=0 --find-renames --diff-filter=ACMR | "$fastest_awk" -v directory="$results_directory/" "$split_diff_by_path"
 }
 
 # Deals the paths round-robin to one worker per core, each running `judge_path` into a numbered report, then
@@ -750,8 +803,17 @@ load_path_files() {
     [ -s "$results_directory/$ordinal.added" ] || return 1
     [ -f "$staged_diff_path" ] || staged_diff_path=$results_directory/$ordinal.added
     staged_added_text=$(< "$results_directory/$ordinal.added")
-    staged_added_line_numbers_list=$(< "$staged_lines_path")
+    staged_added_unquoted_path=$results_directory/$ordinal.added
     staged_file_text=$(< "$staged_text_path")
+    if speaks_c_comments "$staged_path"; then
+        staged_code_path=$results_directory/$ordinal.code
+        staged_added_code_path=$results_directory/$ordinal.added-code
+        staged_added_unquoted_path=$results_directory/$ordinal.added-unquoted
+        blank_c_comments_preserving_columns < "$staged_text_path" > "$staged_code_path"
+        scan_staged_file_marking_added_lines 'FNR in added { print "+" $0 }' "$staged_code_path" > "$staged_added_code_path"
+        blank_c_comments_preserving_columns literals < "$staged_text_path" |
+            scan_staged_file_marking_added_lines 'FNR in added { print "+" $0 }' - > "$staged_added_unquoted_path"
+    fi
 }
 
 # `--all-lines <path>...` judges whole working-tree files as though every line outside a function body were
@@ -762,7 +824,7 @@ if [ "${1:-}" = --changed-lines ]; then
     judge_path() {
         [ -f "$staged_path" ] || return 0
         git diff HEAD --unified=0 -- "$staged_path" |
-            awk -v directory="$results_directory/" -v ordinal=$((ordinal - 1)) "$split_diff_by_path"
+            "$fastest_awk" -v directory="$results_directory/" -v ordinal=$((ordinal - 1)) "$split_diff_by_path"
         staged_text_path=$staged_path
         load_path_files || return 0
         run_shared_checks
@@ -776,7 +838,7 @@ elif [ "${1:-}" = --all-lines ]; then
         staged_file_text=$(< "$staged_path")
         [ -n "$staged_file_text" ] || return 0
         printf '%s\n' "$(lines_outside_function_bodies)" > "$results_directory/$ordinal.lines"
-        awk -v added="$results_directory/$ordinal.added" 'NR == FNR { kept[$1]; next } FNR in kept { print "+" $0 > added }' \
+        "$fastest_awk" -v added="$results_directory/$ordinal.added" 'NR == FNR { kept[$1]; next } FNR in kept { print "+" $0 > added }' \
             "$results_directory/$ordinal.lines" "$staged_path"
         staged_text_path=$staged_path
         load_path_files || return 0

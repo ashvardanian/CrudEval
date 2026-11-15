@@ -1,4 +1,4 @@
-//! UStore benchmark for key-value records, JSON documents and graphs, on its NVMe or RAM engine.
+//! UStore benchmark for key-value records, JSON documents and graphs, on its NVMe, RAM, RocksDB or LevelDB engine.
 //!
 //! Requires a C++ compiler and CMake to build the engines. Every call runs on its worker's executor, in batches.
 //!
@@ -20,7 +20,7 @@ use clap::Parser;
 use serde_json::json;
 use ustore::{
     Arena, CollectionID, Column, DataDirectory, Database, Edge, Engine, Entry, Executor, FieldEntry, IOOptions, Json,
-    Modality, Modification, NVMEOptions, On, RAMOptions, Role, Roles, Status, Text,
+    LevelDBOptions, Modality, Modification, NVMEOptions, On, RAMOptions, RocksDBOptions, Role, Roles, Status, Text,
 };
 
 use crudeval::{
@@ -39,7 +39,7 @@ const TRANSACTION_MAX_DELTAS: usize = 1 << 20;
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
-    /// UStore engine: nvme, or ram, which keeps its image in the data directory.
+    /// UStore engine: nvme, rocksdb, leveldb, or ram, which keeps its image in the data directory.
     #[arg(long, env = "CRUDEVAL_ENGINE", default_value = "nvme", value_parser = |text: &str| text.parse::<Engine>())]
     engine: Engine,
     /// Bytes of memory runs a collection holds before a flush, like 1GB; the engine's default when absent.
@@ -175,7 +175,26 @@ impl UStoreBackend {
                     executor,
                 )
             }
-            other => return Err(format!("UStore's {other} engine is not benchmarked; pick nvme or ram")),
+            // RocksDB and LevelDB keep their default caches, as the page cache is the pool they were built for.
+            Engine::RocksDB => {
+                let executor = Executor::for_ram(&[], 1).map_err(|e| e.to_string())?;
+                let options = RocksDBOptions {
+                    executor: Some(&executor),
+                    ..RocksDBOptions::at(directory)
+                };
+                (Database::open_rocksdb(&options).map_err(|e| e.to_string())?, executor)
+            }
+            Engine::LevelDB if data_model == DataModel::Graph => {
+                return Err("UStore's LevelDB engine has no transactions, which graph mutations need".into());
+            }
+            Engine::LevelDB => {
+                let executor = Executor::for_ram(&[], 1).map_err(|e| e.to_string())?;
+                let options = LevelDBOptions {
+                    executor: Some(&executor),
+                    ..LevelDBOptions::at(directory)
+                };
+                (Database::open_leveldb(&options).map_err(|e| e.to_string())?, executor)
+            }
         };
         let (records, edges) = match data_model {
             DataModel::KeyValue => (
@@ -274,11 +293,7 @@ impl Backend for UStoreBackend {
         ))
     }
     fn flush(&self) -> Result<()> {
-        let mut transaction = self.database.transaction().map_err(|e| e.to_string())?;
-        transaction
-            .commit(ustore::Durability::Flushed)
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        self.database.flush().map_err(|e| e.to_string())
     }
     fn disk_bytes(&self) -> Result<u64> {
         std::iter::once(&self.path)
@@ -822,7 +837,7 @@ mod tests {
 
     #[test]
     fn embedded_contract() {
-        for engine in [Engine::RAM, Engine::NVME] {
+        for engine in [Engine::RAM, Engine::RocksDB, Engine::LevelDB, Engine::NVME] {
             let directory = tempfile::tempdir().unwrap();
             crudeval::assert_backend_contract!(&opened(engine, DataModel::KeyValue, &directory));
         }
@@ -848,7 +863,7 @@ mod tests {
 
     #[test]
     fn document_contract() {
-        for engine in [Engine::RAM, Engine::NVME] {
+        for engine in [Engine::RAM, Engine::RocksDB, Engine::LevelDB, Engine::NVME] {
             let directory = tempfile::tempdir().unwrap();
             crudeval::assert_document_contract!(&opened(engine, DataModel::Documents, &directory));
         }
@@ -856,9 +871,20 @@ mod tests {
 
     #[test]
     fn graph_contract() {
-        for engine in [Engine::RAM, Engine::NVME] {
+        for engine in [Engine::RAM, Engine::RocksDB, Engine::NVME] {
             let directory = tempfile::tempdir().unwrap();
             crudeval::assert_graph_contract!(&opened(engine, DataModel::Graph, &directory));
         }
+        let directory = tempfile::tempdir().unwrap();
+        let leveldb = UStoreBackend::open(
+            directory.path(),
+            &[],
+            Engine::LevelDB,
+            DataModel::Graph,
+            Durability::None,
+            1,
+            None,
+        );
+        assert!(leveldb.is_err());
     }
 }

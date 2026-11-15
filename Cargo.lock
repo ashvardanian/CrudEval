@@ -1197,6 +1197,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "forkunion"
 version = "4.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/ForkUnion#ce67be6511ce8cfc4b139b3e7266ec0e5edc372c"
 dependencies = [
  "cmake",
 ]
@@ -2084,9 +2085,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3270,9 +3271,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator 0.3.0",
@@ -3773,6 +3774,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 [[package]]
 name = "smashtable"
 version = "1.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/SmashTable#30e349dcd1e582896386d959d4a36badce061787"
 
 [[package]]
 name = "snap"
@@ -3846,6 +3848,7 @@ dependencies = [
 [[package]]
 name = "stringzilla"
 version = "6.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/StringZilla#ff22abca2e1f271f37bd8cb10174bc9dd37ed4e7"
 dependencies = [
  "cmake",
 ]
@@ -4610,6 +4613,7 @@ dependencies = [
 [[package]]
 name = "ustore"
 version = "1.0.0-rc.1"
+source = "git+https://github.com/unum-cloud/UStore#507a45e60bc0a80e90e53b5817607446736f83f1"
 dependencies = [
  "cmake",
  "forkunion",

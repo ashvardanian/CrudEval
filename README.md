@@ -53,7 +53,7 @@ cargo run --release --no-default-features --features neo4j-backend \
 | `crud-eval-turso`, embedded Turso 0.8.1                         |     ✓     |     ✓     |        |
 | `crud-eval-surrealdb`, SurrealDB 3.3.0                          |           |     ✓     |   ✓    |
 | `crud-eval-scylladb`, ScyllaDB 2026.3.2                         |     ✓     |     ✓     |        |
-| `crud-eval-ustore`, UStore's NVMe or RAM engine                 |     ✓     |     ✓     |   ✓    |
+| `crud-eval-ustore`, UStore on NVMe, RAM, RocksDB or LevelDB     |     ✓     |     ✓     |   ✓    |
 
 Every binary's flags, engine-specific ones included, are listed in the [CLI Reference](#cli-reference) below.
 Reports include effective durability and distinguish native batches, protocol pipelines, and per-record loops for each operation.
@@ -72,6 +72,7 @@ Documents are typed `score bigint` and `payload text` columns, and updates set t
 Durability `none` disables the keyspace's `durable_writes`, `buffered` uses periodic commit log sync, and `flushed` uses batch sync.
 ScyllaDB needs direct I/O on its data directory, which Docker Desktop's file sharing on macOS does not provide; run it on Linux.
 UStore opens its NVMe engine through `crudeval.ustore.json` in the run's first data directory, and its RAM engine keeps its image there.
+Its RocksDB and LevelDB engines keep their files in that directory too, with the engines' own default caches over the page cache; LevelDB has no transactions, so it serves records and documents but not graphs.
 Every UStore verb takes the whole batch on the engine's executor; updates and deletes first read which keys exist, without their values.
 UStore documents are JSON, read back as `score` and `payload` columns; graph vertices keep their versions in a blobs collection and their edges in a graph collection, identified by slot, and change in transactions.
 `--durability none` writes as `buffered`, since UStore has no log to disable.
@@ -274,7 +275,7 @@ crud-eval-scylladb
 
 crud-eval-ustore
   --engine <ENGINE>                     nvme
-      nvme, or ram, which keeps its image in the data directory.
+      nvme, rocksdb, leveldb, or ram, which keeps its image in the data directory.
   --memory-runs <SIZE>                  the engine's default
       Bytes of memory runs a collection holds before a flush, like 1GB.
 ```
@@ -463,8 +464,8 @@ Plots separate schema versions so their different measurement semantics cannot b
 
 ## Development
 
-The repository pins Rust 1.100, as `beta-2026-10-18` until its stable release.
-CI runs `cargo fmt --check`, Ruff on the plotting script, then `cargo clippy` and `cargo test` with every feature.
+The repository pins Rust 1.100.
+CI runs `cargo clippy` and `cargo test` with every feature on Linux and with the embedded engines on macOS; the pre-commit hook runs rustfmt and Ruff where they are installed.
 `src/` holds the shared library in `bench.rs` and one binary per engine, `scripts/` the plotting and server checks, `.githooks/` the Git hooks, and `docker/` the compose files for the servers.
 Arm the hooks once per clone with `git config core.hooksPath .githooks`.
 Run `scripts/check-servers.sh` for managed server integration checks.
@@ -472,7 +473,6 @@ Run `scripts/check-servers.sh` for managed server integration checks.
 ## Remaining Scope
 
 The implemented backend matrix above describes current support, not the full set of candidates considered during planning.
-UStore's RocksDB and LevelDB engines are not benchmarked through `crud-eval-ustore`.
 Native WiredTiger was deliberately excluded to avoid a separate C build and submodule; MongoDB exercises WiredTiger through a different interface and is not a substitute for a direct engine benchmark.
 Cassandra, FoundationDB, Aerospike, SplinterDB, and Haura remain later candidates, with no adapters or placeholder binaries in this crate.
 

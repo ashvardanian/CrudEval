@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::{
     data::{Distribution, RandomGenerator},
-    Bytes,
+    parse_count, Bytes,
 };
 
 /// Smallest payload: the 16-byte key plus the 8-byte version every value starts with.
@@ -135,33 +135,13 @@ impl FromStr for Workload {
                 .into_iter()
                 .find_map(|(prefix, operation)| name.strip_prefix(prefix).map(|n| (prefix, n, operation)))
                 .ok_or(EXPECTED_WORKLOADS)?;
-                result.batch_size = parse_count(count)
-                    .ok()
-                    .and_then(|count| usize::try_from(count).ok())
-                    .ok_or(EXPECTED_WORKLOADS)?;
+                result.batch_size = parse_count(count).ok_or(EXPECTED_WORKLOADS)?;
                 result.name = format!("{prefix}{}", result.batch_size);
                 vec![(operation, 100)]
             }
         };
         Ok(result)
     }
-}
-
-/// Parses a count like `10000` or `10K`: `K`, `M`, `G`, `T` are powers of 1000 in any case, and zero is rejected.
-pub fn parse_count(text: &str) -> Result<u64, String> {
-    let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
-    let exponent = ["", "k", "m", "g", "t"]
-        .iter()
-        .position(|unit| text[split..].eq_ignore_ascii_case(unit));
-    let count = exponent.and_then(|exponent| {
-        text[..split]
-            .parse::<u64>()
-            .ok()?
-            .checked_mul(1000u64.pow(exponent as u32))
-    });
-    count
-        .filter(|&count| count != 0)
-        .ok_or_else(|| "expected a positive count".into())
 }
 
 /// Parses a size like `64MB`: bare bytes, or `KB`, `MB`, `GB`, `TB` in any case; zero is rejected.
@@ -213,12 +193,8 @@ mod tests {
     }
     #[test]
     fn sizes_are_checked() {
-        assert_eq!(parse_count("1M").unwrap(), 1_000_000);
         assert_eq!(parse_size("64mb").unwrap(), Bytes(64 << 20));
         assert_eq!(parse_value_size("24..1KB").unwrap(), Bytes(24)..=Bytes(1024));
-        for invalid in ["18446744073709551615K", "1.5K", "-1", "+1", "K", "0", "1KB"] {
-            assert!(parse_count(invalid).is_err());
-        }
         for invalid in ["0", "1K", "1KiB", "24B", "+1KB"] {
             assert!(parse_size(invalid).is_err());
         }

@@ -1,27 +1,28 @@
-name: Check
+name: CPU Checks
 on: [push, pull_request]
 jobs:
   check:
-    name: Check on ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-26.04, macos-26]
+    name: Check ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Every Backend on Linux
+            os: ubuntu-26.04
+            features: --all-features
+          - name: Embedded Engines on macOS
+            os: macos-26
+            features: --features rocksdb-backend,lmdb-backend,redb-backend,fjall-backend,sqlite-backend,turso-backend
     steps:
       - name: Check Out Repository
         uses: actions/checkout@v7
       - name: Install Rust 1.100 with Rustfmt and Clippy
-        run: rustup toolchain install beta-2026-10-18 --profile minimal --component rustfmt,clippy
-      - name: Set Up uv
-        uses: astral-sh/setup-uv@v6
+        run: rustup toolchain install 1.100 --profile minimal --component rustfmt,clippy
       - name: Install Clang and CMake
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake
         if: runner.os == 'Linux'
-      - name: Check Formatting
-        run: cargo fmt --all -- --check
-      - name: Check Python Plotting
-        run: uvx ruff check --target-version py311 --extend-select I scripts/plot.py && uvx ruff format --check scripts/plot.py
-      - name: Lint Every Backend
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test Every Backend
-        run: cargo test --locked --all-features
+      - name: Lint ${{ matrix.name }}
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - name: Test ${{ matrix.name }}
+        run: cargo test --locked ${{ matrix.features }}

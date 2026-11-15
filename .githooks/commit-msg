@@ -5,7 +5,7 @@
 # The subject is `<Verb>: <Summary>`, so the history reads as a changelog. A refactor is an Improve, Chore
 # rearranges without changing behaviour, Make touches only the build or the environment, Docs fixes
 # documentation that drifted on its own, and Break marks an incompatible interface change. Git writes merge,
-# `fixup!` and `squash!` subjects and TinySemVer writes `Release:` ones, so those are exempt. Authorship is
+# `fixup!` and `squash!` subjects and a release writes `Release:` ones, so those are exempt. Authorship is
 # the human who committed, so the message carries no assistant attribution.
 #
 # Bypass knowingly, which you almost never should, with: git commit --no-verify
@@ -13,7 +13,7 @@
 set -u
 export LC_ALL=C
 
-approved_verbs='Add|Break|Build|Chore|Docs|Fix|Improve|Make'
+approved_verbs='Add|Break|Chore|Docs|Fix|Improve|Make'
 
 payload=$(grep -v '^#' "$1")
 subject=$(grep -m 1 -v '^[[:space:]]*$' <<< "$payload")

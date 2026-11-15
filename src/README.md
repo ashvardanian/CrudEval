@@ -10,7 +10,7 @@ The shared runner and data model live in:
 
 - [`bench.rs`](bench.rs): `CommonArgs`, configuration sweeps, data manifests, worker coordination, entry budgets, and transaction boundaries.
 - [`backend.rs`](backend.rs): backend/session traits, capabilities, typed batch buffers, keys, data models, and durability policies.
-- [`workload.rs`](workload.rs): workload names, operation shares, batch sizes, and checked count/size parsing.
+- [`workload.rs`](workload.rs): workload names, operation shares, batch sizes, and checked size parsing.
 - [`data.rs`](data.rs): `KeySpace`, random distributions, and the deterministic value pool.
 - [`model.rs`](model.rs): key-value, document, and graph generation and verification.
 

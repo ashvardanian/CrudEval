@@ -80,7 +80,7 @@ impl serde::Serialize for EntryBudget {
 #[derive(Args, Clone, Debug, serde::Serialize)]
 pub struct CommonArgs {
     /// Initial record counts; comma-separated values form a sweep.
-    #[arg(long, env = "CRUDEVAL_RECORDS", value_delimiter = ',', default_value = "100K", value_parser = workload::parse_count)]
+    #[arg(long, env = "CRUDEVAL_RECORDS", value_delimiter = ',', default_value = "100K", value_parser = |text: &str| parse_count_flag(text).map(|count| count as u64))]
     pub records: Vec<u64>,
     /// Worker counts, 0 for every core in the affinity mask; comma-separated values form a sweep.
     #[arg(long, env = "CRUDEVAL_THREADS", value_delimiter = ',', default_value = "0", value_parser = parse_threads_flag)]
@@ -252,8 +252,20 @@ pub fn parse_threads(text: &str, all_cores: NonZeroUsize) -> Option<Threads> {
     }
 }
 
-/// Parses a positive whole number in ASCII digits, like `128`; zero is `None`.
+/// Parses a count like `10000` or `10M`: `K`, `M`, `G`, `T` are powers of 1000 in any case, and zero is `None`.
 pub fn parse_count(text: &str) -> Option<usize> {
+    let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    let exponent = ["", "k", "m", "g", "t"]
+        .iter()
+        .position(|unit| text[split..].eq_ignore_ascii_case(unit))?;
+    let count = text[..split]
+        .parse::<usize>()
+        .ok()?
+        .checked_mul(1000usize.pow(exponent as u32))?;
+    (count != 0).then_some(count)
+}
+
+fn parse_digits(text: &str) -> Option<u64> {
     let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     digits.then(|| text.parse().ok()).flatten().filter(|&count| count != 0)
 }
@@ -261,8 +273,8 @@ pub fn parse_count(text: &str) -> Option<usize> {
 /// Parses a duration like `200ms` or `10s`; a bare number, a fraction or zero is `None`.
 pub fn parse_duration(text: &str) -> Option<Duration> {
     match text.strip_suffix("ms") {
-        Some(count) => parse_count(count).map(|count| Duration::from_millis(count as u64)),
-        None => parse_count(text.strip_suffix('s')?).map(|count| Duration::from_secs(count as u64)),
+        Some(count) => parse_digits(count).map(Duration::from_millis),
+        None => parse_digits(text.strip_suffix('s')?).map(Duration::from_secs),
     }
 }
 
@@ -392,7 +404,7 @@ fn parse_entries_flag(text: &str) -> Result<EntryBudget> {
         Some(percent) => parse_decimal(percent)
             .filter(|percent| *percent > 0.0 && *percent <= 100.0)
             .map(EntryBudget::Percent),
-        None => workload::parse_count(text).ok().map(EntryBudget::Count),
+        None => parse_count(text).map(|count| EntryBudget::Count(count as u64)),
     };
     budget.ok_or_else(|| "expected a positive count like 10K or a percentage like 10%".into())
 }
@@ -1862,6 +1874,15 @@ mod tests {
         budget: u64,
     ) -> output::WorkloadReport {
         execute_phase(backend, args, &workload.parse().unwrap(), keys, model, budget, None).unwrap()
+    }
+    #[test]
+    fn counts_take_decimal_suffixes_and_durations_take_digits() {
+        assert_eq!(parse_count("1M"), Some(1_000_000));
+        for invalid in ["18446744073709551615K", "1.5K", "-1", "+1", "K", "0", "1KB"] {
+            assert_eq!(parse_count(invalid), None);
+        }
+        assert_eq!(parse_duration("10s"), Some(Duration::from_secs(10)));
+        assert_eq!(parse_duration("10Ks"), None);
     }
     #[test]
     fn small_budgets_preserve_insert_uniqueness_and_scan_shards() {
