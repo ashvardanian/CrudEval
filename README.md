@@ -275,6 +275,8 @@ crud-eval-scylladb
 crud-eval-ustore
   --engine <ENGINE>                     nvme
       nvme, or ram, which keeps its image in the data directory.
+  --memory-runs <SIZE>                  the engine's default
+      Bytes of memory runs a collection holds before a flush, like 1GB.
 ```
 
 </details>

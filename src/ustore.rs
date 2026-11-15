@@ -29,7 +29,7 @@ use crudeval::{
         DocumentOutput, DocumentPatch, DocumentRef, DocumentSession, Durability, GraphEdge, GraphInput, GraphOutput,
         GraphPatch, GraphSession, Key, KeysOutput, RecordInput, RecordOutput, Result, TransactionSession, VertexRef,
     },
-    output, run, CommonArgs,
+    output, run, workload, Bytes, CommonArgs,
 };
 
 /// Deltas a transaction may buffer, the engine's ceiling; only a transaction's bytes are taken up front.
@@ -42,6 +42,9 @@ struct Cli {
     /// UStore engine: nvme, or ram, which keeps its image in the data directory.
     #[arg(long, env = "CRUDEVAL_ENGINE", default_value = "nvme", value_parser = |text: &str| text.parse::<Engine>())]
     engine: Engine,
+    /// Bytes of memory runs a collection holds before a flush, like 1GB; the engine's default when absent.
+    #[arg(long, env = "CRUDEVAL_MEMORY_RUNS", value_parser = workload::parse_size)]
+    memory_runs: Option<Bytes>,
 }
 
 fn to_store(key: &Key) -> ustore::Key {
@@ -126,6 +129,7 @@ impl UStoreBackend {
         data_model: DataModel,
         durability: Durability,
         workers: usize,
+        memory_runs: Option<Bytes>,
     ) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let directory = path.to_str().ok_or("data directory is not UTF-8")?;
@@ -154,6 +158,8 @@ impl UStoreBackend {
                     executor: Some(&executor),
                     transaction_max_deltas: TRANSACTION_MAX_DELTAS,
                     memory_limit: budget.memory_limit,
+                    collection_memory_runs_max_bytes: memory_runs.map_or(0, |bytes| bytes.0),
+                    collection_memory_runs_max_deltas: memory_runs.map_or(0, |bytes| (bytes.0 / 256) as usize),
                     ..NVMEOptions::at(&manifest)
                 };
                 (Database::open_nvme(&options).map_err(|e| e.to_string())?, executor)
@@ -772,10 +778,22 @@ impl GraphSession for UStoreSession<'_> {
 
 fn main() -> Result<()> {
     let cli: Cli = crudeval::parse_cli();
-    let settings = [("Engine", cli.engine.to_string())];
+    if cli.memory_runs.is_some() && cli.engine != Engine::NVME {
+        return Err(format!(
+            "--memory-runs sizes the NVMe engine's memory runs, which {} lacks",
+            cli.engine
+        ));
+    }
+    let settings = [
+        ("Engine", cli.engine.to_string()),
+        (
+            "Memory runs",
+            cli.memory_runs.map_or("default".into(), |bytes| bytes.to_string()),
+        ),
+    ];
     run(
         cli.common,
-        json!({"engine": cli.engine.to_string()}),
+        json!({"engine": cli.engine.to_string(), "memory_runs": cli.memory_runs}),
         &settings,
         move |args, path| {
             Ok(Box::new_in(
@@ -786,6 +804,7 @@ fn main() -> Result<()> {
                     args.data_model,
                     args.durability,
                     args.threads[0].0.get(),
+                    cli.memory_runs,
                 )?,
                 System,
             ))
@@ -798,7 +817,7 @@ mod tests {
     use super::*;
 
     fn opened(engine: Engine, data_model: DataModel, directory: &tempfile::TempDir) -> UStoreBackend {
-        UStoreBackend::open(directory.path(), &[], engine, data_model, Durability::None, 1).unwrap()
+        UStoreBackend::open(directory.path(), &[], engine, data_model, Durability::None, 1, None).unwrap()
     }
 
     #[test]
@@ -820,6 +839,7 @@ mod tests {
             DataModel::KeyValue,
             Durability::None,
             1,
+            None,
         )
         .unwrap();
         crudeval::assert_backend_contract!(&backend);
